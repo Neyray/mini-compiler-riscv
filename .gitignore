@@ -1,0 +1,23 @@
+# Build output
+/build/
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.out
+compiler
+
+# Generated assembly / test artifacts
+*.s.tmp
+tests/**/*.actual
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

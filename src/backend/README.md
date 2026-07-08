@@ -21,7 +21,7 @@
 - **输出**：向 **stdout** 写 RV32 汇编，可被 `riscv64-*-gcc -march=rv32im -mabi=ilp32` 汇编链接。
 - 头文件接口放在 `include/backend/`，实现放在本目录。
 
-## 计划实现顺序
+## 实现顺序（均已完成）
 
 1. 打通「最小可运行」：`int main(){ return N; }` → RV32，能在 qemu-riscv32 上返回正确退出码。
 2. 表达式与算术/关系/一元运算、局部变量与栈帧。

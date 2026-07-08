@@ -10,4 +10,6 @@
 > `gcc case.c -o ref && ./ref; echo $?` 生成，再与编译器产物的退出码比对。
 > 性能测试以 `gcc -O2` 生成代码的运行时间为基准。
 
-> 占位目录，待用例设计与联调阶段填充。
+> 现状：`cases/functional/` 已含 21 个功能用例，`scripts/run_tests.sh [-opt]` 以本机 gcc 为基准
+> 自动判分（21/21 通过）；`cases/perf/` + `scripts/perf_compare.sh` 用于与 `gcc -O2` 对比性能；
+> `scripts/crt0.s` 为本地 freestanding 链接用的最小启动例程。可按需继续扩充用例。

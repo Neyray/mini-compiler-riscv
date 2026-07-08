@@ -8,4 +8,5 @@
 - **语法分析**：按文法规约构建抽象语法树 (AST)，交给中端。
 - 头文件接口放在 `include/frontend/`。
 
-> 占位目录，待 B 实现。接口（token 定义、AST 结构）确定后同步到 `docs/`。
+> 已实现：手写词法分析 + 递归下降/优先级爬升语法分析，产出 AST（`AST.h`）。
+> 联调时对 Lexer 块注释与 Parser 记号读取做了修正，详见 `docs/integration-notes.md`。

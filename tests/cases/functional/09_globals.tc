@@ -1,0 +1,12 @@
+const int BASE = 100;
+int counter = 0;
+
+void bump(int k) {
+    counter = counter + k;
+}
+
+int main() {
+    bump(7);
+    bump(BASE / 10);
+    return counter + BASE;
+}

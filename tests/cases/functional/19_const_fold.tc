@@ -1,0 +1,10 @@
+const int A = 2 + 3 * 4;
+const int B = A * A - 1;
+
+int main() {
+    const int C = B % 10;
+    int x = A + B + C;
+    int y = x * 8;
+    int z = !!(A > 0) + (B >= A) + (C < 5 + 1);
+    return (y - x * 7) + z;
+}

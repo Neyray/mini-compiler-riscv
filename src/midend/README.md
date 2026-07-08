@@ -12,4 +12,6 @@
 - 输出：带符号信息的 AST / IR，交给后端。
 - 头文件接口放在 `include/midend/`。
 
-> 占位目录，待 C 实现。
+> 已实现：符号表 + 语义分析 + 类型检查 + 作用域检查，`check()` 返回 `CheckedAST`。
+> 联调时补充了全局变量静态初值求值、放宽了 `while(常量真)` 的返回覆盖判定，详见
+> `docs/integration-notes.md`。

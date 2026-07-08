@@ -1,0 +1,19 @@
+int main() {
+    int i = 0;
+    int total = 0;
+    while (i < 5) {
+        int j = 0;
+        while (j < 5) {
+            j = j + 1;
+            if (j == 3) {
+                continue;
+            }
+            if (i + j > 6) {
+                break;
+            }
+            total = total + i * j;
+        }
+        i = i + 1;
+    }
+    return total;
+}

@@ -40,5 +40,9 @@
 
 ## 状态
 
-骨架阶段，规格已对齐到 ToyC / RV32 / stdin-stdout（见 docs/）。
-等待中端 (C) 交付 AST + 符号接口后开始编码。当前目录仅含占位文件。
+已实现并联调通过。`codegen/CodeGen.cpp` 完成 AST → RV32IM 直接翻译（栈帧、表达式、
+控制流与跳转短路、函数调用与递归、全局/常量），并含 `-opt` 优化（常量折叠/传播、
+乘 2 的幂强度削弱、窥孔清理）。接口见 `include/backend/CodeGen.h`，联调修改记录见
+[`docs/integration-notes.md`](../../docs/integration-notes.md)。功能用例 19/19 通过。
+
+> `regalloc/`、`opt/` 目录为后续性能提升预留（当前优化直接内建在 codegen 中）。

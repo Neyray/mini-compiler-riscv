@@ -1,0 +1,13 @@
+int main() {
+    int a = 4;
+    int b = 7;
+    int r = 0;
+    if (a < b) { r = r + 1; }
+    if (b > a) { r = r + 2; }
+    if (a <= 4) { r = r + 4; }
+    if (b >= 7) { r = r + 8; }
+    if (a == 4) { r = r + 16; }
+    if (a != b) { r = r + 32; }
+    if (a > b) { r = r + 64; }
+    return r;
+}

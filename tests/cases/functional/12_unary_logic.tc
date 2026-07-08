@@ -1,0 +1,15 @@
+int main() {
+    int a = 5;
+    int b = -a;
+    int c = !0;
+    int d = !a;
+    int e = -(-3);
+    int r = 0;
+    if (a > 0 && b < 0) {
+        r = r + 1;
+    }
+    if (c == 1 && d == 0) {
+        r = r + 10;
+    }
+    return r + e;
+}

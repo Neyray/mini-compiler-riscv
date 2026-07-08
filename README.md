@@ -43,7 +43,8 @@ mini-compiler-riscv/
 ├── README.md              # 本文件（项目总览）
 ├── LICENSE
 ├── .gitignore
-├── CMakeLists.txt         # 顶层构建入口（占位，接口确定后补全）
+├── CMakeLists.txt         # 顶层构建入口（CMake）
+├── Makefile               # 顶层构建入口（Make，等价于 CMake）
 ├── docs/                  # 设计文档与分工说明
 │   ├── division-of-labor.md
 │   ├── toyc-spec.md       # ToyC 语言文法与语义约束（任务书摘录，全员依据）
@@ -68,14 +69,17 @@ mini-compiler-riscv/
 └── scripts/               # 构建/运行辅助脚本
 ```
 
-## 构建（规划）
+## 构建
 
-项目使用 **C++（C++20）** 编译，计划采用 CMake 组织构建：
+项目使用 **C++（C++20）** 编译，CMake 与 Make 两种方式等价：
 
 ```bash
+# 方式一：CMake（生成 build/compiler）
 cmake -B build -S .
 cmake --build build -j
-# 生成的编译器可执行文件：build/compiler
+
+# 方式二：Make（生成 ./compiler）
+make
 ```
 
 ## 运行接口（任务书约定）
@@ -100,6 +104,22 @@ qemu-riscv32 ./a.out ; echo "exit code = $?"
 
 > 也可使用 `riscv32-unknown-elf-gcc` + `spike`/`pk`。评测系统以 `gcc -O2` 生成代码的运行时间为性能基准。
 
+## 本地回归测试
+
+ToyC 是 C 的子集，可用本机 `gcc` 直接把 `.tc` 当作 C 编译运行，得到每个用例的期望退出码作为
+基准；再用本编译器生成 RV32 汇编、经 `qemu-riscv32` 运行，比对退出码。用例见
+`tests/cases/functional/`，一键运行：
+
+```bash
+make                              # 先构建出 ./compiler
+bash tests/scripts/run_tests.sh          # 功能测试
+bash tests/scripts/run_tests.sh -opt     # 开启优化后再测一遍
+```
+
+> 说明：本机 `riscv64-linux-gnu-gcc` 缺少 rv32 的 libc/crt multilib，测试脚本改用
+> `-nostdlib` + `tests/scripts/crt0.s`（最小启动例程，调用 `main` 后以其返回值退出）以
+> freestanding 方式链接。评测环境使用其自带 rv32 工具链，本编译器输出为标准汇编，无需该文件。
+
 ## 环境
 
 - 开发环境：WSL2 (Ubuntu 22.04)
@@ -116,9 +136,9 @@ qemu-riscv32 ./a.out ; echo "exit code = $?"
 
 - [x] 仓库骨架 / 目录结构（D）
 - [x] 规格对齐：文档统一到 ToyC / RV32 / stdin-stdout（D）
-- [ ] 前端：词法 + 语法 + AST（B）
-- [ ] 中端：符号表 + 语义 + 类型检查 + 作用域（C）
-- [ ] 后端：RISC-V32 代码生成（D）
-- [ ] 后端：优化（D）
-- [ ] 联调 + 测试（D + A）
+- [x] 前端：词法 + 语法 + AST（B）
+- [x] 中端：符号表 + 语义 + 类型检查 + 作用域（C）
+- [x] 后端：RISC-V32 代码生成（D）
+- [x] 后端：优化（常量折叠/传播、短路跳转、强度削弱、窥孔）（D）
+- [x] 联调 + 测试（D + A）：功能用例 19/19 通过（`-opt` 与非 `-opt` 均通过）
 - [ ] 实验报告（A）

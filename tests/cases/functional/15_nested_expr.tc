@@ -1,0 +1,13 @@
+int f(int x) {
+    return x * x - 1;
+}
+
+int main() {
+    int a = 2;
+    int b = 3;
+    int r = f(a + b) + f(a) * f(b) - (a * b + f(a - b));
+    if (r < 0) {
+        r = -r;
+    }
+    return r % 200;
+}

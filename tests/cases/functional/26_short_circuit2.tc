@@ -1,0 +1,20 @@
+int calls = 0;
+
+int tick(int v) {
+    calls = calls + 1;
+    return v;
+}
+
+int main() {
+    int a = 0;
+    if (tick(0) && tick(1)) {
+        a = a + 1;
+    }
+    if (tick(1) || tick(1)) {
+        a = a + 2;
+    }
+    if (!tick(0) && (tick(1) || tick(0))) {
+        a = a + 4;
+    }
+    return calls * 10 + a;
+}

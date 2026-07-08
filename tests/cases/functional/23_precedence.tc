@@ -1,0 +1,9 @@
+int main() {
+    int a = 2 + 3 * 4 - 10 / 2;
+    int b = 20 - 4 - 3;
+    int c = 2 * 3 + 4 * 5 % 7;
+    int d = 1 < 2 == 1;
+    int e = 3 + 4 > 5 && 2 * 2 <= 4;
+    int r = a + b * 2 + c + d * 10 + e * 100;
+    return r % 256;
+}

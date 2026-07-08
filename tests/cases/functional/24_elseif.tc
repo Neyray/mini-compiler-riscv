@@ -1,0 +1,23 @@
+int grade(int s) {
+    if (s >= 90) {
+        return 4;
+    } else if (s >= 80) {
+        return 3;
+    } else if (s >= 70) {
+        return 2;
+    } else if (s >= 60) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+int main() {
+    int total = 0;
+    total = total + grade(95);
+    total = total + grade(83);
+    total = total + grade(71);
+    total = total + grade(60);
+    total = total + grade(42);
+    return total;
+}

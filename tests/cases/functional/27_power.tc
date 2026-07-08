@@ -1,0 +1,16 @@
+int power(int base, int exp) {
+    int result = 1;
+    int i = 0;
+    while (i < exp) {
+        result = result * base;
+        i = i + 1;
+    }
+    return result;
+}
+
+int main() {
+    int a = power(2, 8);
+    int b = power(3, 4);
+    int c = power(5, 0);
+    return (a + b + c) % 256;
+}

@@ -1,0 +1,9 @@
+int main() {
+    int big = 2000000000;
+    int sum = big + big;
+    int neg = 0 - 2147483647;
+    int wrap = neg - 2;
+    int m = big / 1000000;
+    int r = m + (sum % 100 + 100) + (wrap % 50 + 50);
+    return r % 256;
+}

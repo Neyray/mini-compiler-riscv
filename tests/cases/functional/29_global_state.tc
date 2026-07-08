@@ -1,0 +1,21 @@
+const int STEP = 3;
+int state = 1;
+
+int advance() {
+    state = state * 2 + STEP;
+    return state;
+}
+
+int reset(int v) {
+    state = v;
+    return state;
+}
+
+int main() {
+    advance();
+    advance();
+    int snapshot = state;
+    reset(0);
+    advance();
+    return (snapshot + state) % 256;
+}

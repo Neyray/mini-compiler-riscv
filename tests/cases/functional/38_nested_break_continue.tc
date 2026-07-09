@@ -1,0 +1,19 @@
+int main() {
+    int sum = 0;
+    int i = 0;
+    while (i < 5) {
+        i = i + 1;
+        int j = 0;
+        while (j < 5) {
+            j = j + 1;
+            if (j == 2) {
+                continue;
+            }
+            if (i + j > 6) {
+                break;
+            }
+            sum = sum + 1;
+        }
+    }
+    return sum;
+}

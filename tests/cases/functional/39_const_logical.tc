@@ -1,0 +1,11 @@
+const int A = 5;
+const int B = !A;
+const int C = !0;
+const int D = A > 3 && A < 10;
+const int E = A == 0 || A != 5;
+const int F = !(A >= 1 && A <= 10);
+
+int main() {
+    int r = A + B * 10 + C * 100 + D * 2 + E * 20 + F * 200;
+    return r % 256;
+}

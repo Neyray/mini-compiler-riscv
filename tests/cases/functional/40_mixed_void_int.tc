@@ -1,0 +1,22 @@
+int total = 0;
+
+void record(int x) {
+    total = total + x;
+}
+
+int getCount() {
+    return total;
+}
+
+int addAndGet(int x) {
+    record(x);
+    return getCount();
+}
+
+int main() {
+    int a = addAndGet(3);
+    record(7);
+    int b = getCount();
+    int c = addAndGet(5);
+    return a + b + c;
+}

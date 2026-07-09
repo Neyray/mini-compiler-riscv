@@ -1,0 +1,10 @@
+int main() {
+    int a = 10;
+    int r = 0;
+    if (a > 5)
+        if (a > 15)
+            r = 100;
+        else
+            r = 50;
+    return r + a;
+}

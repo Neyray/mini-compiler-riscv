@@ -1,10 +1,11 @@
 #include "CodeGen.h"
+#include <algorithm>
 #include <stdexcept>
 
 CodeGen::CodeGen(bool optimize)
     : opt(optimize), labelCounter(0), totalLocals(0), regLocals(0),
       stackLocalBase(0), tempBaseOffset(0), localCursor(0), funcHasCall(false),
-      aRegLeaf(false) {}
+      aRegLeaf(false), tempBias(0) {}
 
 // ---------- 作用域 ----------
 
@@ -88,7 +89,7 @@ void CodeGen::memInsn(const std::string& op, const std::string& reg, int offset)
 }
 
 int CodeGen::tempOffset(int slot) const {
-    return tempBaseOffset - 4 * slot;
+    return tempBaseOffset - 4 * (slot + tempBias);
 }
 
 void CodeGen::storeTemp(int slot) {
@@ -104,18 +105,50 @@ void CodeGen::loadTemp(int slot, const std::string& reg) {
 int CodeGen::countLocalDecls(StmtNode* node) const {
     if (node == nullptr) return 0;
     if (auto* decl = dynamic_cast<DeclStmtNode*>(node)) {
-        return decl->isConst ? 0 : 1;
+        return (decl->isConst ? 0 : 1) + inlineLocalsInExpr(decl->initExpr.get());
     }
     if (auto* block = dynamic_cast<BlockNode*>(node)) {
         int n = 0;
         for (const auto& s : block->stmts) n += countLocalDecls(s.get());
         return n;
     }
+    if (auto* asn = dynamic_cast<AssignNode*>(node)) {
+        return inlineLocalsInExpr(asn->rhs.get());
+    }
     if (auto* ifn = dynamic_cast<IfNode*>(node)) {
-        return countLocalDecls(ifn->thenStmt.get()) + countLocalDecls(ifn->elseStmt.get());
+        return inlineLocalsInExpr(ifn->condition.get()) +
+               countLocalDecls(ifn->thenStmt.get()) + countLocalDecls(ifn->elseStmt.get());
     }
     if (auto* wh = dynamic_cast<WhileNode*>(node)) {
-        return countLocalDecls(wh->body.get());
+        return inlineLocalsInExpr(wh->condition.get()) + countLocalDecls(wh->body.get());
+    }
+    if (auto* ret = dynamic_cast<ReturnNode*>(node)) {
+        return inlineLocalsInExpr(ret->retExpr.get());
+    }
+    if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
+        return inlineLocalsInExpr(es->expr.get());
+    }
+    return 0;
+}
+
+// 表达式内所有可内联调用点将额外占用的局部存储（形参 + 被内联函数体的局部）。
+// 被内联函数是叶子（不含调用），故递归不会无限展开。
+int CodeGen::inlineLocalsInExpr(ExprNode* node) const {
+    if (node == nullptr) return 0;
+    if (auto* un = dynamic_cast<UnaryNode*>(node)) {
+        return inlineLocalsInExpr(un->operand.get());
+    }
+    if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        return inlineLocalsInExpr(bin->left.get()) + inlineLocalsInExpr(bin->right.get());
+    }
+    if (auto* call = dynamic_cast<CallNode*>(node)) {
+        int n = 0;
+        for (const auto& a : call->args) n += inlineLocalsInExpr(a.get());
+        if (inlinableFuncs.count(call->funcName)) {
+            FuncDefNode* f = funcDefs.at(call->funcName);
+            n += static_cast<int>(f->params.size()) + countLocalDecls(f->body.get());
+        }
+        return n;
     }
     return 0;
 }
@@ -139,6 +172,16 @@ int CodeGen::exprTempNeed(ExprNode* node) const {
     }
     if (auto* call = dynamic_cast<CallNode*>(node)) {
         int n = static_cast<int>(call->args.size());
+        if (opt && inlinableFuncs.count(call->funcName)) {
+            // 内联展开：实参依次在当前深度求值（结果直接进形参存储，不占槽），
+            // 之后函数体的临时槽经 tempBias 平移到当前深度之上。
+            int best = stmtTempNeed(funcDefs.at(call->funcName)->body.get());
+            for (int i = 0; i < n; ++i) {
+                int need = exprTempNeed(call->args[i].get());
+                if (need > best) best = need;
+            }
+            return best;
+        }
         int best = n;
         for (int i = 0; i < n; ++i) {
             int need = i + exprTempNeed(call->args[i].get());
@@ -147,6 +190,138 @@ int CodeGen::exprTempNeed(ExprNode* node) const {
         return best;
     }
     return 0;
+}
+
+// ---------- AST 规模统计（内联判定） ----------
+
+int CodeGen::nodeCountExpr(ExprNode* node) const {
+    if (node == nullptr) return 0;
+    if (auto* un = dynamic_cast<UnaryNode*>(node)) {
+        return 1 + nodeCountExpr(un->operand.get());
+    }
+    if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        return 1 + nodeCountExpr(bin->left.get()) + nodeCountExpr(bin->right.get());
+    }
+    if (auto* call = dynamic_cast<CallNode*>(node)) {
+        int n = 1;
+        for (const auto& a : call->args) n += nodeCountExpr(a.get());
+        return n;
+    }
+    return 1;
+}
+
+int CodeGen::nodeCountStmt(StmtNode* node) const {
+    if (node == nullptr) return 0;
+    if (auto* block = dynamic_cast<BlockNode*>(node)) {
+        int n = 1;
+        for (const auto& s : block->stmts) n += nodeCountStmt(s.get());
+        return n;
+    }
+    if (auto* decl = dynamic_cast<DeclStmtNode*>(node)) {
+        return 1 + nodeCountExpr(decl->initExpr.get());
+    }
+    if (auto* asn = dynamic_cast<AssignNode*>(node)) {
+        return 1 + nodeCountExpr(asn->rhs.get());
+    }
+    if (auto* ifn = dynamic_cast<IfNode*>(node)) {
+        return 1 + nodeCountExpr(ifn->condition.get()) +
+               nodeCountStmt(ifn->thenStmt.get()) + nodeCountStmt(ifn->elseStmt.get());
+    }
+    if (auto* wh = dynamic_cast<WhileNode*>(node)) {
+        return 1 + nodeCountExpr(wh->condition.get()) + nodeCountStmt(wh->body.get());
+    }
+    if (auto* ret = dynamic_cast<ReturnNode*>(node)) {
+        return 1 + nodeCountExpr(ret->retExpr.get());
+    }
+    if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
+        return 1 + nodeCountExpr(es->expr.get());
+    }
+    return 1;
+}
+
+// ---------- 条件常量提升的收集 ----------
+
+// 从一个条件表达式中挑出参与关系比较的非零字面量（0 直接用 zero 寄存器，无需提升）。
+void CodeGen::collectCondConstLits(ExprNode* cond, std::vector<int>& out) const {
+    if (cond == nullptr) return;
+    if (auto* un = dynamic_cast<UnaryNode*>(cond)) {
+        if (un->op == "!") collectCondConstLits(un->operand.get(), out);
+        return;
+    }
+    auto* bin = dynamic_cast<BinaryNode*>(cond);
+    if (bin == nullptr) return;
+    if (bin->op == "&&" || bin->op == "||") {
+        collectCondConstLits(bin->left.get(), out);
+        collectCondConstLits(bin->right.get(), out);
+        return;
+    }
+    const std::string& op = bin->op;
+    if (op != "<" && op != ">" && op != "<=" && op != ">=" && op != "==" && op != "!=") return;
+    for (ExprNode* side : {bin->left.get(), bin->right.get()}) {
+        auto* lit = dynamic_cast<LiteralNode*>(side);
+        if (lit != nullptr && lit->value != 0 &&
+            std::find(out.begin(), out.end(), lit->value) == out.end()) {
+            out.push_back(lit->value);
+        }
+    }
+}
+
+// 收集执行频率高的条件比较常量：while 条件总是收集；if 条件仅在循环内收集。
+// 深入可内联调用点的函数体（内联后这些条件同样出现在本函数中）。
+void CodeGen::collectHoistConstsExpr(ExprNode* node, std::vector<int>& out, bool inLoop) const {
+    if (node == nullptr) return;
+    if (auto* un = dynamic_cast<UnaryNode*>(node)) {
+        collectHoistConstsExpr(un->operand.get(), out, inLoop);
+        return;
+    }
+    if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        collectHoistConstsExpr(bin->left.get(), out, inLoop);
+        collectHoistConstsExpr(bin->right.get(), out, inLoop);
+        return;
+    }
+    if (auto* call = dynamic_cast<CallNode*>(node)) {
+        for (const auto& a : call->args) collectHoistConstsExpr(a.get(), out, inLoop);
+        if (inlinableFuncs.count(call->funcName)) {
+            collectHoistConsts(funcDefs.at(call->funcName)->body.get(), out, inLoop);
+        }
+    }
+}
+
+void CodeGen::collectHoistConsts(StmtNode* node, std::vector<int>& out, bool inLoop) const {
+    if (node == nullptr) return;
+    if (auto* block = dynamic_cast<BlockNode*>(node)) {
+        for (const auto& s : block->stmts) collectHoistConsts(s.get(), out, inLoop);
+        return;
+    }
+    if (auto* decl = dynamic_cast<DeclStmtNode*>(node)) {
+        collectHoistConstsExpr(decl->initExpr.get(), out, inLoop);
+        return;
+    }
+    if (auto* asn = dynamic_cast<AssignNode*>(node)) {
+        collectHoistConstsExpr(asn->rhs.get(), out, inLoop);
+        return;
+    }
+    if (auto* ifn = dynamic_cast<IfNode*>(node)) {
+        if (inLoop) collectCondConstLits(ifn->condition.get(), out);
+        collectHoistConstsExpr(ifn->condition.get(), out, inLoop);
+        collectHoistConsts(ifn->thenStmt.get(), out, inLoop);
+        collectHoistConsts(ifn->elseStmt.get(), out, inLoop);
+        return;
+    }
+    if (auto* wh = dynamic_cast<WhileNode*>(node)) {
+        collectCondConstLits(wh->condition.get(), out);
+        collectHoistConstsExpr(wh->condition.get(), out, true);
+        collectHoistConsts(wh->body.get(), out, true);
+        return;
+    }
+    if (auto* ret = dynamic_cast<ReturnNode*>(node)) {
+        collectHoistConstsExpr(ret->retExpr.get(), out, inLoop);
+        return;
+    }
+    if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
+        collectHoistConstsExpr(es->expr.get(), out, inLoop);
+        return;
+    }
 }
 
 int CodeGen::stmtTempNeed(StmtNode* node) const {
@@ -366,6 +541,26 @@ void CodeGen::generate(CompUnitNode* root, std::ostream& out) {
         }
     }
 
+    funcDefs.clear();
+    inlinableFuncs.clear();
+    for (const auto& item : root->items) {
+        if (auto* func = dynamic_cast<FuncDefNode*>(item.get())) {
+            funcDefs[func->name] = func;
+        }
+    }
+    if (opt) {
+        // 可内联判定：叶子函数（不含任何调用，天然排除递归）、局部与形参总量
+        // 能进寄存器、函数体规模小。此时 inlinableFuncs 为空，countLocalDecls
+        // 不会额外计数，判定结果与生成阶段一致。
+        for (const auto& [name, f] : funcDefs) {
+            if (stmtContainsCall(f->body.get())) continue;
+            int locals = static_cast<int>(f->params.size()) + countLocalDecls(f->body.get());
+            if (locals > 8) continue;
+            if (nodeCountStmt(f->body.get()) > 48) continue;
+            inlinableFuncs.insert(name);
+        }
+    }
+
     for (const auto& item : root->items) {
         if (auto* func = dynamic_cast<FuncDefNode*>(item.get())) {
             genFunc(func);
@@ -383,6 +578,8 @@ void CodeGen::generate(CompUnitNode* root, std::ostream& out) {
 void CodeGen::genFunc(FuncDefNode* func) {
     cur.clear();
     loopLabels.clear();
+    condConstRegs.clear();
+    tempBias = 0;
 
     int nparams = static_cast<int>(func->params.size());
     totalLocals = nparams + countLocalDecls(func->body.get());
@@ -422,10 +619,24 @@ void CodeGen::genFunc(FuncDefNode* func) {
     int stackLocals = totalLocals - regLocals;
     int temps = stmtTempNeed(func->body.get());
 
-    stackLocalBase = -12 - 4 * regLocals;
+    // 条件常量提升：把循环中频繁比较的字面量装入空闲的 s 寄存器（s 寄存器跨调用
+    // 保持，故对含调用的循环体同样有效），循环内每轮省下一条 li。
+    std::vector<int> hoisted;
+    if (opt) {
+        collectHoistConsts(func->body.get(), hoisted, false);
+        int avail = 11 - regLocals;
+        if (avail < 0) avail = 0;
+        if (static_cast<int>(hoisted.size()) > avail) hoisted.resize(avail);
+        for (int i = 0; i < static_cast<int>(hoisted.size()); ++i) {
+            condConstRegs[hoisted[i]] = "s" + std::to_string(1 + regLocals + i);
+        }
+    }
+    int savedRegs = regLocals + static_cast<int>(hoisted.size());
+
+    stackLocalBase = -12 - 4 * savedRegs;
     tempBaseOffset = stackLocalBase - 4 * stackLocals;
 
-    int frameWords = 2 + regLocals + stackLocals + temps;
+    int frameWords = 2 + savedRegs + stackLocals + temps;
     int frame = (4 * frameWords + 15) & ~15;
 
     // 序言：分配帧，保存 ra（非叶子）、旧 s0、用到的 s1..s(regLocals)，建立 s0。
@@ -440,7 +651,7 @@ void CodeGen::genFunc(FuncDefNode* func) {
     }
     if (funcHasCall) emit("sw ra, -4(t0)");
     emit("sw s0, -8(t0)");
-    for (int i = 0; i < regLocals; ++i) {
+    for (int i = 0; i < savedRegs; ++i) {
         emit("sw s" + std::to_string(1 + i) + ", " + std::to_string(-12 - 4 * i) + "(t0)");
     }
     emit("mv s0, t0");
@@ -470,11 +681,16 @@ void CodeGen::genFunc(FuncDefNode* func) {
         }
     }
 
+    // 提升的条件常量就位（每个函数只装载一次）。
+    for (int i = 0; i < static_cast<int>(hoisted.size()); ++i) {
+        loadImm(condConstRegs[hoisted[i]], hoisted[i]);
+    }
+
     genBlock(func->body.get(), false);
 
     emitLabel(epilogueLabel);
     if (funcHasCall) emit("lw ra, -4(s0)");
-    for (int i = 0; i < regLocals; ++i) {
+    for (int i = 0; i < savedRegs; ++i) {
         emit("lw s" + std::to_string(1 + i) + ", " + std::to_string(-12 - 4 * i) + "(s0)");
     }
     if (smallFrame) {
@@ -522,9 +738,13 @@ void CodeGen::genStmt(StmtNode* node) {
             }
         }
         VarInfo info = assignLocalLocation();
-        genExpr(decl->initExpr.get(), 0);
-        if (info.kind == VarInfo::Reg) emit("mv " + info.reg + ", a0");
-        else memInsn("sw", "a0", info.offset);
+        if (opt && info.kind == VarInfo::Reg) {
+            genExprInto(decl->initExpr.get(), info.reg, 0);
+        } else {
+            genExpr(decl->initExpr.get(), 0);
+            if (info.kind == VarInfo::Reg) emit("mv " + info.reg + ", a0");
+            else memInsn("sw", "a0", info.offset);
+        }
         scopes.back()[decl->name] = info;
         return;
     }
@@ -532,16 +752,21 @@ void CodeGen::genStmt(StmtNode* node) {
     if (auto* asn = dynamic_cast<AssignNode*>(node)) {
         if (tryEmitOptimizedAssign(asn)) return;
 
+        const VarInfo* found = lookupVar(asn->name);
+        if (found == nullptr) throw std::runtime_error("codegen: undefined variable " + asn->name);
+        VarInfo v = *found;  // 值拷贝：rhs 内的内联展开会临时切换作用域栈
+        if (opt && v.kind == VarInfo::Reg) {
+            genExprInto(asn->rhs.get(), v.reg, 0);
+            return;
+        }
         genExpr(asn->rhs.get(), 0);
-        const VarInfo* v = lookupVar(asn->name);
-        if (v == nullptr) throw std::runtime_error("codegen: undefined variable " + asn->name);
-        if (v->kind == VarInfo::Global) {
-            emit("la t6, " + v->label);
+        if (v.kind == VarInfo::Global) {
+            emit("la t6, " + v.label);
             emit("sw a0, 0(t6)");
-        } else if (v->kind == VarInfo::Reg) {
-            emit("mv " + v->reg + ", a0");
-        } else if (v->kind == VarInfo::Local) {
-            memInsn("sw", "a0", v->offset);
+        } else if (v.kind == VarInfo::Reg) {
+            emit("mv " + v.reg + ", a0");
+        } else if (v.kind == VarInfo::Local) {
+            memInsn("sw", "a0", v.offset);
         }
         return;
     }
@@ -613,9 +838,25 @@ bool CodeGen::tryEmitRegBinary(BinaryNode* node) {
 
     std::string left;
     std::string right;
-    if (!tryGetReg(node->left.get(), left) || !tryGetReg(node->right.get(), right)) {
-        return false;
+    bool leftOk = tryGetReg(node->left.get(), left);
+    bool rightOk = tryGetReg(node->right.get(), right);
+
+    // 一侧是寄存器变量、另一侧是 0 或已提升进 s 寄存器的常量时，同样可以直连。
+    int c;
+    if (leftOk && !rightOk && tryEvalConst(node->right.get(), c)) {
+        if (c == 0) { right = "zero"; rightOk = true; }
+        else if (auto it = condConstRegs.find(c); it != condConstRegs.end()) {
+            right = it->second;
+            rightOk = true;
+        }
+    } else if (rightOk && !leftOk && tryEvalConst(node->left.get(), c)) {
+        if (c == 0) { left = "zero"; leftOk = true; }
+        else if (auto it = condConstRegs.find(c); it != condConstRegs.end()) {
+            left = it->second;
+            leftOk = true;
+        }
     }
+    if (!leftOk || !rightOk) return false;
 
     const std::string& op = node->op;
     if (op == "+") emit("add a0, " + left + ", " + right);
@@ -882,22 +1123,26 @@ void CodeGen::genCondJump(ExprNode* node, const std::string& target,
                 bool rightReg = tryGetReg(bin->right.get(), right);
                 int constant;
 
+                // 常量操作数的寄存器化：0 用 zero；已提升的常量用其 s 寄存器；
+                // 其余返回空串，由调用处临时 li 到 t6。
+                auto constReg = [&](int c) -> std::string {
+                    if (c == 0) return "zero";
+                    auto it = condConstRegs.find(c);
+                    return it != condConstRegs.end() ? it->second : std::string();
+                };
+
                 if (leftReg && rightReg) {
                     emitBranch(left, right);
                     return;
                 } else if (leftReg && tryEvalConst(bin->right.get(), constant)) {
-                    if (constant == 0) emitBranch(left, "zero");
-                    else {
-                        loadImm("t6", constant);
-                        emitBranch(left, "t6");
-                    }
+                    std::string cr = constReg(constant);
+                    if (cr.empty()) { loadImm("t6", constant); cr = "t6"; }
+                    emitBranch(left, cr);
                     return;
                 } else if (rightReg && tryEvalConst(bin->left.get(), constant)) {
-                    if (constant == 0) emitBranch("zero", right);
-                    else {
-                        loadImm("t6", constant);
-                        emitBranch("t6", right);
-                    }
+                    std::string cr = constReg(constant);
+                    if (cr.empty()) { loadImm("t6", constant); cr = "t6"; }
+                    emitBranch(cr, right);
                     return;
                 }
 
@@ -911,10 +1156,21 @@ void CodeGen::genCondJump(ExprNode* node, const std::string& target,
                     emitBranch("a0", right);
                     return;
                 }
-                if (tryEvalConst(bin->right.get(), constant) && constant == 0) {
-                    genExpr(bin->left.get(), depth);
-                    emitBranch("a0", "zero");
-                    return;
+                if (tryEvalConst(bin->right.get(), constant)) {
+                    std::string cr = constReg(constant);
+                    if (!cr.empty()) {
+                        genExpr(bin->left.get(), depth);
+                        emitBranch("a0", cr);
+                        return;
+                    }
+                }
+                if (tryEvalConst(bin->left.get(), constant)) {
+                    std::string cr = constReg(constant);
+                    if (!cr.empty()) {
+                        genExpr(bin->right.get(), depth);
+                        emitBranch(cr, "a0");
+                        return;
+                    }
                 }
             }
 
@@ -931,7 +1187,73 @@ void CodeGen::genCondJump(ExprNode* node, const std::string& target,
 
 // ---------- 函数调用 ----------
 
+// 把表达式的值直接求到指定寄存器：常量 li、寄存器变量 mv，其余走 a0 中转。
+void CodeGen::genExprInto(ExprNode* node, const std::string& reg, int depth) {
+    int cv;
+    if (tryEvalConst(node, cv)) {
+        loadImm(reg, cv);
+        return;
+    }
+    std::string src;
+    if (tryGetReg(node, src)) {
+        if (src != reg) emit("mv " + reg + ", " + src);
+        return;
+    }
+    genExpr(node, depth);
+    if (reg != "a0") emit("mv " + reg + ", a0");
+}
+
+// 小叶子函数在调用点展开：实参直接写入形参的存储位置（等同调用者新增局部，
+// 已计入帧预分析），函数体在调用者栈帧上就地生成。生成期间：
+//   - 作用域栈只保留全局层再叠加形参层，杜绝调用者局部被被内联体误解析；
+//   - 被内联体的 return 改写为跳到本次展开的结束标签，返回值仍留在 a0；
+//   - 其临时槽经 tempBias 整体平移，避开调用者此刻在用的槽位。
+void CodeGen::genInlineCall(CallNode* node, int depth) {
+    FuncDefNode* callee = funcDefs.at(node->funcName);
+    int n = static_cast<int>(node->args.size());
+
+    std::vector<VarInfo> paramLocs;
+    paramLocs.reserve(n);
+    for (int i = 0; i < n; ++i) paramLocs.push_back(assignLocalLocation());
+
+    // 实参仍在调用者作用域中求值（形参尚未进作用域），逐个写入形参存储。
+    for (int i = 0; i < n; ++i) {
+        if (paramLocs[i].kind == VarInfo::Reg) {
+            genExprInto(node->args[i].get(), paramLocs[i].reg, depth);
+        } else {
+            genExpr(node->args[i].get(), depth);
+            memInsn("sw", "a0", paramLocs[i].offset);
+        }
+    }
+
+    auto savedScopes = std::move(scopes);
+    scopes.clear();
+    scopes.push_back(savedScopes[0]);  // 仅保留全局层
+    pushScope();
+    for (int i = 0; i < n; ++i) {
+        scopes.back()[callee->params[i]] = paramLocs[i];
+    }
+
+    std::string savedEpilogue = epilogueLabel;
+    int savedBias = tempBias;
+    epilogueLabel = newLabel();
+    tempBias += depth;
+
+    genBlock(callee->body.get(), false);
+    emitLabel(epilogueLabel);
+
+    tempBias = savedBias;
+    epilogueLabel = savedEpilogue;
+    popScope();
+    scopes = std::move(savedScopes);
+}
+
 void CodeGen::genCall(CallNode* node, int depth) {
+    if (opt && inlinableFuncs.count(node->funcName)) {
+        genInlineCall(node, depth);
+        return;
+    }
+
     int n = static_cast<int>(node->args.size());
 
     if (opt && n == 1) {

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <ostream>
 
 // RISC-V32 (RV32IM / ilp32) 代码生成器。
@@ -46,6 +47,10 @@ private:
     int localCursor;
     bool funcHasCall;       // 叶子函数可省去 ra 的保存/恢复
     bool aRegLeaf;          // 叶子函数：局部全部放入调用者保存寄存器 a1..a7，完全省去栈帧
+    int tempBias;           // 内联展开时，被内联体的临时槽在调用者临时区中的整体平移量
+    std::unordered_map<std::string, FuncDefNode*> funcDefs;  // 函数名 → 定义
+    std::unordered_set<std::string> inlinableFuncs;          // 可在调用点展开的小叶子函数
+    std::unordered_map<int, std::string> condConstRegs;      // 提升进空闲 s 寄存器的条件常量
     std::string epilogueLabel;
     std::vector<std::pair<std::string, std::string>> loopLabels;
 
@@ -73,6 +78,15 @@ private:
     // 表达式求值可能达到的最大嵌套深度（上界，用于判断叶子函数是否需要栈上临时槽）。
     int exprMaxDepth(ExprNode* node, int depth) const;
     int stmtMaxDepth(StmtNode* node) const;
+    // AST 规模统计（内联判定用）。
+    int nodeCountExpr(ExprNode* node) const;
+    int nodeCountStmt(StmtNode* node) const;
+    // 表达式内所有可内联调用点将额外占用的局部存储数。
+    int inlineLocalsInExpr(ExprNode* node) const;
+    // 收集适合提升进 s 寄存器的条件比较常量。
+    void collectCondConstLits(ExprNode* cond, std::vector<int>& out) const;
+    void collectHoistConsts(StmtNode* node, std::vector<int>& out, bool inLoop) const;
+    void collectHoistConstsExpr(ExprNode* node, std::vector<int>& out, bool inLoop) const;
 
     bool tryEvalConst(ExprNode* node, int& out) const;
 
@@ -84,6 +98,9 @@ private:
     void genCondJump(ExprNode* node, const std::string& target,
                      bool jumpWhenTrue, int depth);
     void genCall(CallNode* node, int depth);
+    void genInlineCall(CallNode* node, int depth);
+    // 把表达式的值直接求到指定寄存器（常量 li / 寄存器变量 mv 免中转）。
+    void genExprInto(ExprNode* node, const std::string& reg, int depth);
     bool tryEmitRegBinary(BinaryNode* node);
     bool tryEmitOptimizedAssign(AssignNode* node);
     // 计算二元运算左操作数：结果寄存器名经 leftReg 返回，右操作数已在 a0。

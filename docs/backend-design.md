@@ -114,13 +114,15 @@ func:
 a && b:  eval a; beqz a, Lfalse; eval b; snez a0,b; j Lend; Lfalse: li a0,0; Lend:
 a || b:  eval a; bnez a, Ltrue ; eval b; snez a0,b; j Lend; Ltrue : li a0,1; Lend:
 ```
-在 `if`/`while` 的条件位置，可进一步做**跳转短路**（`genCondBranch(cond, trueLbl, falseLbl)`），
-直接生成到目标标签的分支，省去物化 0/1，属于早期就能做的优化。
+在 `if`/`while` 的条件位置，进一步做**跳转短路 + 落空布局**（`genCondJump(cond, target, jumpWhenTrue)`），
+生成到目标标签的单条条件分支，另一侧顺序落下，省去物化 0/1 与多余的无条件跳转；关系运算按需取反以复用单条分支。
 
 ### 2.4 控制流
-- `if (c) T else E`：`genCondBranch(c, Lthen, Lelse)` → `Lthen: T; j Lend; Lelse: E; Lend:`。
-- `while (c) B`：`Lcond: genCondBranch(c, Lbody, Lend); Lbody: B; j Lcond; Lend:`。
-  维护一个 `(Lcond, Lend)` 循环标签栈供 `continue → j Lcond`、`break → j Lend` 使用。
+- `if (c) T`：`genCondJump(c 为假 → Lend); T; Lend:`（条件为真顺序落入 `T`）。
+- `if (c) T else E`：`genCondJump(c 为假 → Lelse); T; j Lend; Lelse: E; Lend:`。
+- `while (c) B`（**循环旋转**）：`j Lcond; Lbody: B; Lcond: genCondJump(c 为真 → Lbody); Lend:`。
+  条件下沉到循环底部，稳态每轮迭代仅一条“为真回跳”分支；维护 `(Lcond, Lend)` 循环标签栈供
+  `continue → j Lcond`、`break → j Lend` 使用。
 - 标签用函数内自增计数器生成唯一名（如 `.L<func>_<n>`）。
 
 ### 2.5 函数调用
@@ -144,7 +146,9 @@ a || b:  eval a; bnez a, Ltrue ; eval b; snez a0,b; j Lend; Ltrue : li a0,1; Len
    用到的 `s` 寄存器在序言/尾声成对保存恢复。
 2. **表达式临时值 → `t0–t5`**：二元运算右子树不含函数调用且嵌套深度 < 6 时左操作数留在
    `t` 寄存器，否则溢出到栈临时槽以保证跨调用安全。
-3. **叶子函数**（函数体不含任何调用）省去 `ra` 的保存与恢复。
+3. **叶子函数**（函数体不含任何调用）省去 `ra` 的保存与恢复。**叶子无栈帧**：若叶子函数局部数 ≤ 7
+   且表达式嵌套浅，则把全部局部改放调用者保存寄存器 `a1..a7`，完全省去栈帧与序言/尾声——由于只用
+   调用者保存寄存器、从不触碰 `s0..s11`，天然保持被调用者保存寄存器不变，是热点小函数最大的收益来源。
 
 > 可选的进一步提升：活跃变量分析 + 线性扫描/图着色以跨基本块复用与合并寄存器。
 
@@ -158,8 +162,9 @@ a || b:  eval a; bnez a, Ltrue ; eval b; snez a0,b; j Lend; Ltrue : li a0,1; Len
 4. **单参数直传**：单参数调用省去参数临时槽的存取；多参数和嵌套调用保持原有安全路径。
 5. **小栈帧序言/尾声**：在 12 位偏移范围内使用 `addi` 形式，否则回退到通用大帧实现。
 6. **强度削弱与窥孔清理**：乘 2 的幂改为移位，删除 `mv x,x`、相邻标签跳转和紧邻的冗余加载。
-7. **跳转短路**：条件表达式直接生成分支（见 2.3）。
-8. （可选）公共子表达式消除、循环不变量外提和受控函数内联。
+7. **跳转短路 + 落空布局 + 循环旋转**：条件生成单目标分支、常见路径顺序落下，`while` 条件下沉到底部（见 2.4）。
+8. **叶子函数无栈帧**：叶子函数局部改放 `a1..a7`，消除每次调用的序言/尾声访存（见 §3）。
+9. （可选）公共子表达式消除、循环不变量外提和受控函数内联。
 
 > 优化必须**保持语义**（尤其短路求值、除零行为、`return` 覆盖）。每加一个 pass 都要跑回归。
 
@@ -178,8 +183,9 @@ a || b:  eval a; bnez a, Ltrue ; eval b; snez a0,b; j Lend; Ltrue : li a0,1; Len
   → `qemu-riscv32 ./a.out; echo $?`，与等价 C 程序的退出码逐一比对（脚本放 `tests/scripts/`）。
 
 最近一次 WSL2 验证中，42 个功能用例在普通和 `-opt` 模式下均通过。性能用例 `prime.tc` 的
-退出码与 GCC `-O2` 一致（均为 192），最佳时间为本项目 `0.32s`、GCC `-O2` `0.18s`，
-对应性能比 `0.56`。
+退出码与 GCC `-O2` 一致（均为 192）；引入「叶子函数无栈帧」与「条件落空布局 + 循环旋转」后，
+本项目 `-opt` 产物的最佳时间（12 次取最小）由 `0.32s` 降至 `0.27s`（相对基线快约 18%），
+GCC `-O2` 为 `0.18s`，对应性能比由 `0.56` 提升至 `0.67`。
 
 ## 6. 接口决策（已确认）
 

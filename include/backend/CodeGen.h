@@ -45,6 +45,7 @@ private:
     int tempBaseOffset;     // 临时区起始偏移（相对 s0）
     int localCursor;
     bool funcHasCall;       // 叶子函数可省去 ra 的保存/恢复
+    bool aRegLeaf;          // 叶子函数：局部全部放入调用者保存寄存器 a1..a7，完全省去栈帧
     std::string epilogueLabel;
     std::vector<std::pair<std::string, std::string>> loopLabels;
 
@@ -69,6 +70,9 @@ private:
     int stmtTempNeed(StmtNode* node) const;
     bool containsCall(ExprNode* node) const;
     bool stmtContainsCall(StmtNode* node) const;
+    // 表达式求值可能达到的最大嵌套深度（上界，用于判断叶子函数是否需要栈上临时槽）。
+    int exprMaxDepth(ExprNode* node, int depth) const;
+    int stmtMaxDepth(StmtNode* node) const;
 
     bool tryEvalConst(ExprNode* node, int& out) const;
 
@@ -77,8 +81,8 @@ private:
     void genBlock(BlockNode* node, bool createScope);
     void genExpr(ExprNode* node, int depth);
     void genLogical(BinaryNode* node, int depth);
-    void genCond(ExprNode* node, const std::string& labelTrue,
-                 const std::string& labelFalse, int depth);
+    void genCondJump(ExprNode* node, const std::string& target,
+                     bool jumpWhenTrue, int depth);
     void genCall(CallNode* node, int depth);
     bool tryEmitRegBinary(BinaryNode* node);
     bool tryEmitOptimizedAssign(AssignNode* node);

@@ -3,7 +3,8 @@
 
 CodeGen::CodeGen(bool optimize)
     : opt(optimize), labelCounter(0), totalLocals(0), regLocals(0),
-      stackLocalBase(0), tempBaseOffset(0), localCursor(0), funcHasCall(false) {}
+      stackLocalBase(0), tempBaseOffset(0), localCursor(0), funcHasCall(false),
+      aRegLeaf(false) {}
 
 // ---------- 作用域 ----------
 
@@ -25,10 +26,17 @@ const CodeGen::VarInfo* CodeGen::lookupVar(const std::string& name) const {
     return nullptr;
 }
 
-// 为一个局部声明/形参分配存储：前 11 个进 s1..s11，其余落栈。
+// 为一个局部声明/形参分配存储。
+// 叶子无栈帧模式：全部落入调用者保存寄存器 a1..a7（第 idx 个 → a(idx+1)）。
+// 普通模式：前 11 个进 s1..s11，其余落栈。
 CodeGen::VarInfo CodeGen::assignLocalLocation() {
     int idx = localCursor++;
     VarInfo info;
+    if (aRegLeaf) {
+        info.kind = VarInfo::Reg;
+        info.reg = "a" + std::to_string(1 + idx);
+        return info;
+    }
     if (idx < 11) {
         info.kind = VarInfo::Reg;
         info.reg = "s" + std::to_string(1 + idx);
@@ -219,6 +227,63 @@ bool CodeGen::stmtContainsCall(StmtNode* node) const {
     return false;
 }
 
+// 表达式求值可能达到的最大嵌套深度（上界）。genBinaryOperands 只在 depth>=6 时
+// 才把左操作数溢出到栈临时槽；若整段代码的最大深度 <6，则叶子函数无需任何栈临时槽。
+// 这里按“所有二元运算都走通用路径”估计（右子树深度 +1），是安全的上界。
+int CodeGen::exprMaxDepth(ExprNode* node, int depth) const {
+    if (node == nullptr) return depth;
+    if (dynamic_cast<LiteralNode*>(node) || dynamic_cast<VarNode*>(node)) return depth;
+    if (auto* un = dynamic_cast<UnaryNode*>(node)) {
+        return exprMaxDepth(un->operand.get(), depth);
+    }
+    if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        int l = exprMaxDepth(bin->left.get(), depth);
+        int rdepth = (bin->op == "&&" || bin->op == "||") ? depth : depth + 1;
+        int r = exprMaxDepth(bin->right.get(), rdepth);
+        return l > r ? l : r;
+    }
+    // 含调用的表达式不会用于叶子无栈帧判定，返回大值以排除。
+    if (dynamic_cast<CallNode*>(node)) return 1000;
+    return depth;
+}
+
+int CodeGen::stmtMaxDepth(StmtNode* node) const {
+    if (node == nullptr) return 0;
+    if (auto* block = dynamic_cast<BlockNode*>(node)) {
+        int m = 0;
+        for (const auto& s : block->stmts) {
+            int t = stmtMaxDepth(s.get());
+            if (t > m) m = t;
+        }
+        return m;
+    }
+    if (auto* decl = dynamic_cast<DeclStmtNode*>(node)) {
+        return exprMaxDepth(decl->initExpr.get(), 0);
+    }
+    if (auto* asn = dynamic_cast<AssignNode*>(node)) {
+        return exprMaxDepth(asn->rhs.get(), 0);
+    }
+    if (auto* ifn = dynamic_cast<IfNode*>(node)) {
+        int a = exprMaxDepth(ifn->condition.get(), 0);
+        int b = stmtMaxDepth(ifn->thenStmt.get());
+        int c = stmtMaxDepth(ifn->elseStmt.get());
+        int m = a > b ? a : b;
+        return m > c ? m : c;
+    }
+    if (auto* wh = dynamic_cast<WhileNode*>(node)) {
+        int a = exprMaxDepth(wh->condition.get(), 0);
+        int b = stmtMaxDepth(wh->body.get());
+        return a > b ? a : b;
+    }
+    if (auto* ret = dynamic_cast<ReturnNode*>(node)) {
+        return exprMaxDepth(ret->retExpr.get(), 0);
+    }
+    if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
+        return exprMaxDepth(es->expr.get(), 0);
+    }
+    return 0;
+}
+
 // ---------- 编译期常量求值 ----------
 
 bool CodeGen::tryEvalConst(ExprNode* node, int& out) const {
@@ -321,22 +386,47 @@ void CodeGen::genFunc(FuncDefNode* func) {
 
     int nparams = static_cast<int>(func->params.size());
     totalLocals = nparams + countLocalDecls(func->body.get());
+    localCursor = 0;
+    funcHasCall = stmtContainsCall(func->body.get());
+
+    // 叶子无栈帧模式：无函数调用、局部数 <=7（可全部放入 a1..a7），
+    // 且表达式嵌套深度 <6（不会产生栈上临时槽）。此时函数只使用调用者保存寄存器，
+    // 天然保持全部被调用者保存寄存器不变，可完全省去栈帧与序言/尾声。
+    aRegLeaf = opt && !funcHasCall && totalLocals <= 7 &&
+               stmtMaxDepth(func->body.get()) < 6;
+
+    epilogueLabel = newLabel();
+    emit(".globl " + func->name);
+    emitLabel(func->name);
+
+    if (aRegLeaf) {
+        pushScope();
+        // 形参各自的寄存器家：第 i 个形参 a_i -> a_(i+1)。
+        for (int i = 0; i < nparams; ++i) {
+            scopes.back()[func->params[i]] = assignLocalLocation();
+        }
+        // 逆序搬移，避免把尚未读取的后续入参覆盖掉。
+        for (int i = nparams - 1; i >= 0; --i) {
+            emit("mv a" + std::to_string(i + 1) + ", a" + std::to_string(i));
+        }
+        genBlock(func->body.get(), false);
+        emitLabel(epilogueLabel);
+        emit("ret");
+        popScope();
+        peephole();
+        for (const auto& l : cur) textLines.push_back(l);
+        return;
+    }
+
     regLocals = totalLocals < 11 ? totalLocals : 11;
     int stackLocals = totalLocals - regLocals;
     int temps = stmtTempNeed(func->body.get());
-    localCursor = 0;
-    funcHasCall = stmtContainsCall(func->body.get());
 
     stackLocalBase = -12 - 4 * regLocals;
     tempBaseOffset = stackLocalBase - 4 * stackLocals;
 
     int frameWords = 2 + regLocals + stackLocals + temps;
     int frame = (4 * frameWords + 15) & ~15;
-
-    epilogueLabel = newLabel();
-
-    emit(".globl " + func->name);
-    emitLabel(func->name);
 
     // 序言：分配帧，保存 ra（非叶子）、旧 s0、用到的 s1..s(regLocals)，建立 s0。
     bool smallFrame = frame <= 2047;
@@ -457,20 +547,18 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* ifn = dynamic_cast<IfNode*>(node)) {
-        std::string lthen = newLabel();
         std::string lend = newLabel();
         if (ifn->elseStmt != nullptr) {
             std::string lelse = newLabel();
-            genCond(ifn->condition.get(), lthen, lelse, 0);
-            emitLabel(lthen);
+            // 条件为假时跳到 else，为真则顺序落入 then（省去一次无条件跳转）。
+            genCondJump(ifn->condition.get(), lelse, false, 0);
             genStmt(ifn->thenStmt.get());
             emit("j " + lend);
             emitLabel(lelse);
             genStmt(ifn->elseStmt.get());
             emitLabel(lend);
         } else {
-            genCond(ifn->condition.get(), lthen, lend, 0);
-            emitLabel(lthen);
+            genCondJump(ifn->condition.get(), lend, false, 0);
             genStmt(ifn->thenStmt.get());
             emitLabel(lend);
         }
@@ -478,16 +566,18 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* wh = dynamic_cast<WhileNode*>(node)) {
+        // 循环旋转：条件测试置于循环底部，稳态每次迭代仅一条“为真回跳”分支，
+        // 省去底部的无条件回跳。首次进入先跳到条件处测试。
         std::string lcond = newLabel();
         std::string lbody = newLabel();
         std::string lend = newLabel();
-        emitLabel(lcond);
-        genCond(wh->condition.get(), lbody, lend, 0);
+        emit("j " + lcond);
         emitLabel(lbody);
         loopLabels.push_back({lcond, lend});
         genStmt(wh->body.get());
         loopLabels.pop_back();
-        emit("j " + lcond);
+        emitLabel(lcond);
+        genCondJump(wh->condition.get(), lbody, true, 0);
         emitLabel(lend);
         return;
     }
@@ -610,6 +700,20 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
     }
 
     if (auto* un = dynamic_cast<UnaryNode*>(node)) {
+        if (opt) {
+            std::string reg;
+            if (tryGetReg(un->operand.get(), reg)) {
+                if (un->op == "-") {
+                    emit("neg a0, " + reg);
+                    return;
+                }
+                if (un->op == "!") {
+                    emit("seqz a0, " + reg);
+                    return;
+                }
+            }
+        }
+
         genExpr(un->operand.get(), depth);
         if (un->op == "-") emit("neg a0, a0");
         else if (un->op == "!") emit("seqz a0, a0");
@@ -628,6 +732,26 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
         }
 
         if (tryEmitRegBinary(bin)) return;
+
+        if (opt && (bin->op == "+" || bin->op == "-")) {
+            std::string reg;
+            int constant;
+            long long delta;
+            if (tryGetReg(bin->left.get(), reg) && tryEvalConst(bin->right.get(), constant)) {
+                delta = bin->op == "+" ? constant : -static_cast<long long>(constant);
+                if (delta >= -2048 && delta <= 2047) {
+                    if (delta == 0) emit("mv a0, " + reg);
+                    else emit("addi a0, " + reg + ", " + std::to_string(delta));
+                    return;
+                }
+            } else if (bin->op == "+" && tryGetReg(bin->right.get(), reg) &&
+                       tryEvalConst(bin->left.get(), constant) &&
+                       constant >= -2048 && constant <= 2047) {
+                if (constant == 0) emit("mv a0, " + reg);
+                else emit("addi a0, " + reg + ", " + std::to_string(constant));
+                return;
+            }
+        }
 
         // 强度削弱（-opt）：乘以 2 的幂改为左移（除法不化简：负数截断除法与右移不等价）。
         if (opt && bin->op == "*") {
@@ -685,38 +809,72 @@ void CodeGen::genLogical(BinaryNode* node, int depth) {
     }
 }
 
-void CodeGen::genCond(ExprNode* node, const std::string& labelTrue,
-                      const std::string& labelFalse, int depth) {
+// 条件跳转：对 node 求值后只发一条条件分支到 target；
+// jumpWhenTrue 为真表示“条件成立时跳转”，否则“条件不成立时跳转”，另一侧顺序落下。
+// 支持 !、&&、|| 的短路，以及关系运算的直接分支（含操作数取反以省去无条件跳转）。
+void CodeGen::genCondJump(ExprNode* node, const std::string& target,
+                          bool jumpWhenTrue, int depth) {
     int cv;
     if (tryEvalConst(node, cv)) {
-        emit("j " + (cv != 0 ? labelTrue : labelFalse));
+        if ((cv != 0) == jumpWhenTrue) emit("j " + target);
         return;
     }
 
     if (auto* un = dynamic_cast<UnaryNode*>(node)) {
         if (un->op == "!") {
-            genCond(un->operand.get(), labelFalse, labelTrue, depth);
+            genCondJump(un->operand.get(), target, !jumpWhenTrue, depth);
             return;
         }
     }
 
     if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
         if (bin->op == "&&") {
-            std::string mid = newLabel();
-            genCond(bin->left.get(), mid, labelFalse, depth);
-            emitLabel(mid);
-            genCond(bin->right.get(), labelTrue, labelFalse, depth);
+            if (jumpWhenTrue) {
+                std::string skip = newLabel();
+                genCondJump(bin->left.get(), skip, false, depth);
+                genCondJump(bin->right.get(), target, true, depth);
+                emitLabel(skip);
+            } else {
+                genCondJump(bin->left.get(), target, false, depth);
+                genCondJump(bin->right.get(), target, false, depth);
+            }
             return;
         }
         if (bin->op == "||") {
-            std::string mid = newLabel();
-            genCond(bin->left.get(), labelTrue, mid, depth);
-            emitLabel(mid);
-            genCond(bin->right.get(), labelTrue, labelFalse, depth);
+            if (jumpWhenTrue) {
+                genCondJump(bin->left.get(), target, true, depth);
+                genCondJump(bin->right.get(), target, true, depth);
+            } else {
+                std::string skip = newLabel();
+                genCondJump(bin->left.get(), skip, true, depth);
+                genCondJump(bin->right.get(), target, false, depth);
+                emitLabel(skip);
+            }
             return;
         }
         const std::string& op = bin->op;
         if (op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!=") {
+            // 若“不成立时跳转”，把比较运算取反，仍用单条分支表达。
+            std::string eop = op;
+            if (!jumpWhenTrue) {
+                if (op == "<") eop = ">=";
+                else if (op == ">") eop = "<=";
+                else if (op == "<=") eop = ">";
+                else if (op == ">=") eop = "<";
+                else if (op == "==") eop = "!=";
+                else eop = "==";
+            }
+            auto emitBranch = [&](const std::string& lo, const std::string& ro) {
+                std::string br;
+                if (eop == "<") br = "blt " + lo + ", " + ro + ", ";
+                else if (eop == ">") br = "blt " + ro + ", " + lo + ", ";
+                else if (eop == "<=") br = "bge " + ro + ", " + lo + ", ";
+                else if (eop == ">=") br = "bge " + lo + ", " + ro + ", ";
+                else if (eop == "==") br = "beq " + lo + ", " + ro + ", ";
+                else br = "bne " + lo + ", " + ro + ", ";
+                emit(br + target);
+            };
+
             if (opt) {
                 std::string left;
                 std::string right;
@@ -725,49 +883,50 @@ void CodeGen::genCond(ExprNode* node, const std::string& labelTrue,
                 int constant;
 
                 if (leftReg && rightReg) {
-                    // Both operands already live in registers, so no a0/t0 shuffle is needed.
+                    emitBranch(left, right);
+                    return;
                 } else if (leftReg && tryEvalConst(bin->right.get(), constant)) {
-                    loadImm("t6", constant);
-                    right = "t6";
-                    rightReg = true;
+                    if (constant == 0) emitBranch(left, "zero");
+                    else {
+                        loadImm("t6", constant);
+                        emitBranch(left, "t6");
+                    }
+                    return;
                 } else if (rightReg && tryEvalConst(bin->left.get(), constant)) {
-                    loadImm("t6", constant);
-                    left = "t6";
-                    leftReg = true;
+                    if (constant == 0) emitBranch("zero", right);
+                    else {
+                        loadImm("t6", constant);
+                        emitBranch("t6", right);
+                    }
+                    return;
                 }
 
-                if (leftReg && rightReg) {
-                    std::string br;
-                    if (op == "<") br = "blt " + left + ", " + right + ", ";
-                    else if (op == ">") br = "blt " + right + ", " + left + ", ";
-                    else if (op == "<=") br = "bge " + right + ", " + left + ", ";
-                    else if (op == ">=") br = "bge " + left + ", " + right + ", ";
-                    else if (op == "==") br = "beq " + left + ", " + right + ", ";
-                    else br = "bne " + left + ", " + right + ", ";
-                    emit(br + labelTrue);
-                    emit("j " + labelFalse);
+                if (leftReg) {
+                    genExpr(bin->right.get(), depth);
+                    emitBranch(left, "a0");
+                    return;
+                }
+                if (rightReg) {
+                    genExpr(bin->left.get(), depth);
+                    emitBranch("a0", right);
+                    return;
+                }
+                if (tryEvalConst(bin->right.get(), constant) && constant == 0) {
+                    genExpr(bin->left.get(), depth);
+                    emitBranch("a0", "zero");
                     return;
                 }
             }
 
             std::string L;
             genBinaryOperands(bin, depth, L);
-            std::string br;
-            if (op == "<") br = "blt " + L + ", a0, ";
-            else if (op == ">") br = "blt a0, " + L + ", ";
-            else if (op == "<=") br = "bge a0, " + L + ", ";
-            else if (op == ">=") br = "bge " + L + ", a0, ";
-            else if (op == "==") br = "beq " + L + ", a0, ";
-            else br = "bne " + L + ", a0, ";
-            emit(br + labelTrue);
-            emit("j " + labelFalse);
+            emitBranch(L, "a0");
             return;
         }
     }
 
     genExpr(node, depth);
-    emit("bnez a0, " + labelTrue);
-    emit("j " + labelFalse);
+    emit((jumpWhenTrue ? "bnez a0, " : "beqz a0, ") + target);
 }
 
 // ---------- 函数调用 ----------

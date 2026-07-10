@@ -52,6 +52,7 @@ private:
     void popScope();
     const VarInfo* lookupVar(const std::string& name) const;
     VarInfo assignLocalLocation();
+    bool tryGetReg(ExprNode* node, std::string& reg) const;
 
     void emit(const std::string& line);
     void emitLabel(const std::string& label);
@@ -79,6 +80,8 @@ private:
     void genCond(ExprNode* node, const std::string& labelTrue,
                  const std::string& labelFalse, int depth);
     void genCall(CallNode* node, int depth);
+    bool tryEmitRegBinary(BinaryNode* node);
+    bool tryEmitOptimizedAssign(AssignNode* node);
     // 计算二元运算左操作数：结果寄存器名经 leftReg 返回，右操作数已在 a0。
     void genBinaryOperands(BinaryNode* node, int depth, std::string& leftReg);
 

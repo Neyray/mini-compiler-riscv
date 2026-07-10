@@ -39,6 +39,17 @@ CodeGen::VarInfo CodeGen::assignLocalLocation() {
     return info;
 }
 
+bool CodeGen::tryGetReg(ExprNode* node, std::string& reg) const {
+    auto* var = dynamic_cast<VarNode*>(node);
+    if (var == nullptr) return false;
+
+    const VarInfo* info = lookupVar(var->name);
+    if (info == nullptr || info->kind != VarInfo::Reg) return false;
+
+    reg = info->reg;
+    return true;
+}
+
 // ---------- 发射辅助 ----------
 
 void CodeGen::emit(const std::string& line) {
@@ -328,9 +339,15 @@ void CodeGen::genFunc(FuncDefNode* func) {
     emitLabel(func->name);
 
     // 序言：分配帧，保存 ra（非叶子）、旧 s0、用到的 s1..s(regLocals)，建立 s0。
-    emit("li t0, " + std::to_string(frame));
-    emit("sub sp, sp, t0");
-    emit("add t0, sp, t0");
+    bool smallFrame = frame <= 2047;
+    if (smallFrame) {
+        emit("addi sp, sp, -" + std::to_string(frame));
+        emit("addi t0, sp, " + std::to_string(frame));
+    } else {
+        emit("li t0, " + std::to_string(frame));
+        emit("sub sp, sp, t0");
+        emit("add t0, sp, t0");
+    }
     if (funcHasCall) emit("sw ra, -4(t0)");
     emit("sw s0, -8(t0)");
     for (int i = 0; i < regLocals; ++i) {
@@ -370,9 +387,14 @@ void CodeGen::genFunc(FuncDefNode* func) {
     for (int i = 0; i < regLocals; ++i) {
         emit("lw s" + std::to_string(1 + i) + ", " + std::to_string(-12 - 4 * i) + "(s0)");
     }
-    emit("lw t6, -8(s0)");
-    emit("mv sp, s0");
-    emit("mv s0, t6");
+    if (smallFrame) {
+        emit("mv sp, s0");
+        emit("lw s0, -8(s0)");
+    } else {
+        emit("lw t6, -8(s0)");
+        emit("mv sp, s0");
+        emit("mv s0, t6");
+    }
     emit("ret");
 
     popScope();
@@ -418,6 +440,8 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* asn = dynamic_cast<AssignNode*>(node)) {
+        if (tryEmitOptimizedAssign(asn)) return;
+
         genExpr(asn->rhs.get(), 0);
         const VarInfo* v = lookupVar(asn->name);
         if (v == nullptr) throw std::runtime_error("codegen: undefined variable " + asn->name);
@@ -494,6 +518,62 @@ void CodeGen::genStmt(StmtNode* node) {
 
 // ---------- 表达式 ----------
 
+bool CodeGen::tryEmitRegBinary(BinaryNode* node) {
+    if (!opt) return false;
+
+    std::string left;
+    std::string right;
+    if (!tryGetReg(node->left.get(), left) || !tryGetReg(node->right.get(), right)) {
+        return false;
+    }
+
+    const std::string& op = node->op;
+    if (op == "+") emit("add a0, " + left + ", " + right);
+    else if (op == "-") emit("sub a0, " + left + ", " + right);
+    else if (op == "*") emit("mul a0, " + left + ", " + right);
+    else if (op == "/") emit("div a0, " + left + ", " + right);
+    else if (op == "%") emit("rem a0, " + left + ", " + right);
+    else if (op == "<") emit("slt a0, " + left + ", " + right);
+    else if (op == ">") emit("slt a0, " + right + ", " + left);
+    else if (op == "<=") { emit("slt a0, " + right + ", " + left); emit("xori a0, a0, 1"); }
+    else if (op == ">=") { emit("slt a0, " + left + ", " + right); emit("xori a0, a0, 1"); }
+    else if (op == "==") { emit("sub a0, " + left + ", " + right); emit("seqz a0, a0"); }
+    else if (op == "!=") { emit("sub a0, " + left + ", " + right); emit("snez a0, a0"); }
+    else return false;
+    return true;
+}
+
+bool CodeGen::tryEmitOptimizedAssign(AssignNode* node) {
+    if (!opt) return false;
+
+    const VarInfo* target = lookupVar(node->name);
+    if (target == nullptr || target->kind != VarInfo::Reg) return false;
+
+    auto* bin = dynamic_cast<BinaryNode*>(node->rhs.get());
+    if (bin == nullptr || (bin->op != "+" && bin->op != "-")) return false;
+
+    int constant;
+    long long delta;
+    auto* left = dynamic_cast<VarNode*>(bin->left.get());
+    auto* right = dynamic_cast<VarNode*>(bin->right.get());
+
+    if (left != nullptr && left->name == node->name &&
+        tryEvalConst(bin->right.get(), constant)) {
+        delta = bin->op == "+" ? constant : -static_cast<long long>(constant);
+    } else if (bin->op == "+" && right != nullptr && right->name == node->name &&
+               tryEvalConst(bin->left.get(), constant)) {
+        delta = constant;
+    } else {
+        return false;
+    }
+
+    if (delta < -2048 || delta > 2047) return false;
+    if (delta != 0) {
+        emit("addi " + target->reg + ", " + target->reg + ", " + std::to_string(delta));
+    }
+    return true;
+}
+
 // 计算二元运算的两个操作数：左值放入某寄存器（名字经 leftReg 返回），右值留在 a0。
 // 若右子树不含调用且深度够浅，左值暂存于 t(depth)；否则溢出到栈临时槽、再取回 t6。
 void CodeGen::genBinaryOperands(BinaryNode* node, int depth, std::string& leftReg) {
@@ -546,6 +626,8 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
             genLogical(bin, depth);
             return;
         }
+
+        if (tryEmitRegBinary(bin)) return;
 
         // 强度削弱（-opt）：乘以 2 的幂改为左移（除法不化简：负数截断除法与右移不等价）。
         if (opt && bin->op == "*") {
@@ -635,6 +717,39 @@ void CodeGen::genCond(ExprNode* node, const std::string& labelTrue,
         }
         const std::string& op = bin->op;
         if (op == "<" || op == ">" || op == "<=" || op == ">=" || op == "==" || op == "!=") {
+            if (opt) {
+                std::string left;
+                std::string right;
+                bool leftReg = tryGetReg(bin->left.get(), left);
+                bool rightReg = tryGetReg(bin->right.get(), right);
+                int constant;
+
+                if (leftReg && rightReg) {
+                    // Both operands already live in registers, so no a0/t0 shuffle is needed.
+                } else if (leftReg && tryEvalConst(bin->right.get(), constant)) {
+                    loadImm("t6", constant);
+                    right = "t6";
+                    rightReg = true;
+                } else if (rightReg && tryEvalConst(bin->left.get(), constant)) {
+                    loadImm("t6", constant);
+                    left = "t6";
+                    leftReg = true;
+                }
+
+                if (leftReg && rightReg) {
+                    std::string br;
+                    if (op == "<") br = "blt " + left + ", " + right + ", ";
+                    else if (op == ">") br = "blt " + right + ", " + left + ", ";
+                    else if (op == "<=") br = "bge " + right + ", " + left + ", ";
+                    else if (op == ">=") br = "bge " + left + ", " + right + ", ";
+                    else if (op == "==") br = "beq " + left + ", " + right + ", ";
+                    else br = "bne " + left + ", " + right + ", ";
+                    emit(br + labelTrue);
+                    emit("j " + labelFalse);
+                    return;
+                }
+            }
+
             std::string L;
             genBinaryOperands(bin, depth, L);
             std::string br;
@@ -659,6 +774,12 @@ void CodeGen::genCond(ExprNode* node, const std::string& labelTrue,
 
 void CodeGen::genCall(CallNode* node, int depth) {
     int n = static_cast<int>(node->args.size());
+
+    if (opt && n == 1) {
+        genExpr(node->args[0].get(), depth);
+        emit("call " + node->funcName);
+        return;
+    }
 
     // 实参从左到右求值并溢出到栈临时槽（跨后续实参/调用安全）。
     for (int i = 0; i < n; ++i) {

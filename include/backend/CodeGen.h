@@ -116,7 +116,7 @@ private:
     void genInlineCall(CallNode* node, int depth);
     // 把表达式的值直接求到指定寄存器（常量 li / 寄存器变量 mv 免中转）。
     void genExprInto(ExprNode* node, const std::string& reg, int depth);
-    bool tryEmitRegBinary(BinaryNode* node);
+    bool tryEmitRegBinary(BinaryNode* node, const std::string& dest = "a0");
     bool tryEmitOptimizedAssign(AssignNode* node);
     // 计算二元运算左操作数：结果寄存器名经 leftReg 返回，右操作数已在 a0。
     void genBinaryOperands(BinaryNode* node, int depth, std::string& leftReg);

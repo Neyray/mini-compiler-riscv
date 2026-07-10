@@ -323,6 +323,24 @@ void CodeGen::collectHoistConstsExpr(ExprNode* node, std::vector<int>& out, bool
         return;
     }
     if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        // 循环内算术运算的常量操作数：乘/除/模任何非零常量都需要 li 装载；
+        // 加/减仅当超出 12 位立即数范围（否则 addi 单指令即可）。提升后每轮省一条 li。
+        if (inLoop) {
+            auto consider = [&](ExprNode* side) {
+                auto* lit = dynamic_cast<LiteralNode*>(side);
+                if (lit == nullptr || lit->value == 0) return;
+                bool needReg =
+                    (bin->op == "*" || bin->op == "/" || bin->op == "%") ||
+                    ((bin->op == "+" || bin->op == "-") &&
+                     (lit->value < -2048 || lit->value > 2047));
+                if (needReg &&
+                    std::find(out.begin(), out.end(), lit->value) == out.end()) {
+                    out.push_back(lit->value);
+                }
+            };
+            consider(bin->left.get());
+            consider(bin->right.get());
+        }
         collectHoistConstsExpr(bin->left.get(), out, inLoop);
         collectHoistConstsExpr(bin->right.get(), out, inLoop);
         return;
@@ -662,6 +680,20 @@ void CodeGen::genFunc(FuncDefNode* func) {
         for (int i = nparams - 1; i >= 0; --i) {
             emit("mv a" + std::to_string(i + 1) + ", a" + std::to_string(i));
         }
+        // 条件常量提升：把循环中频繁比较的字面量装入剩余的 a 寄存器
+        // （叶子函数无调用，a 寄存器在函数内稳定）。
+        if (opt) {
+            std::vector<int> hoistedLeaf;
+            collectHoistConsts(func->body.get(), hoistedLeaf, false);
+            int availLeaf = 7 - totalLocals;
+            if (availLeaf < 0) availLeaf = 0;
+            if (static_cast<int>(hoistedLeaf.size()) > availLeaf) hoistedLeaf.resize(availLeaf);
+            for (int i = 0; i < static_cast<int>(hoistedLeaf.size()); ++i) {
+                std::string reg = "a" + std::to_string(1 + totalLocals + i);
+                condConstRegs[hoistedLeaf[i]] = reg;
+                loadImm(reg, hoistedLeaf[i]);
+            }
+        }
         tailEntryLabel = newLabel();
         emitLabel(tailEntryLabel);
         genBlock(func->body.get(), false);
@@ -970,17 +1002,24 @@ void CodeGen::genStmt(StmtNode* node) {
 
 // ---------- 表达式 ----------
 
-bool CodeGen::tryEmitRegBinary(BinaryNode* node) {
+bool CodeGen::tryEmitRegBinary(BinaryNode* node, const std::string& dest) {
     if (!opt) return false;
 
     std::string left;
     std::string right;
     bool leftOk = tryGetReg(node->left.get(), left);
     bool rightOk = tryGetReg(node->right.get(), right);
+    const std::string& op = node->op;
 
-    // 一侧是寄存器变量、另一侧是 0 或已提升进 s 寄存器的常量时，同样可以直连。
     int c;
     if (leftOk && !rightOk && tryEvalConst(node->right.get(), c)) {
+        // 12 位立即数可用单条 addi / slti 直达目标。
+        if (c >= -2048 && c <= 2047) {
+            if (op == "+") { emit("addi " + dest + ", " + left + ", " + std::to_string(c)); return true; }
+            if (op == "-" && c > -2048) { emit("addi " + dest + ", " + left + ", " + std::to_string(-c)); return true; }
+            if (op == "<") { emit("slti " + dest + ", " + left + ", " + std::to_string(c)); return true; }
+        }
+        // 其余情况：0 用 zero；已提升的常量用其寄存器。
         if (c == 0) { right = "zero"; rightOk = true; }
         else if (auto it = condConstRegs.find(c); it != condConstRegs.end()) {
             right = it->second;
@@ -995,18 +1034,17 @@ bool CodeGen::tryEmitRegBinary(BinaryNode* node) {
     }
     if (!leftOk || !rightOk) return false;
 
-    const std::string& op = node->op;
-    if (op == "+") emit("add a0, " + left + ", " + right);
-    else if (op == "-") emit("sub a0, " + left + ", " + right);
-    else if (op == "*") emit("mul a0, " + left + ", " + right);
-    else if (op == "/") emit("div a0, " + left + ", " + right);
-    else if (op == "%") emit("rem a0, " + left + ", " + right);
-    else if (op == "<") emit("slt a0, " + left + ", " + right);
-    else if (op == ">") emit("slt a0, " + right + ", " + left);
-    else if (op == "<=") { emit("slt a0, " + right + ", " + left); emit("xori a0, a0, 1"); }
-    else if (op == ">=") { emit("slt a0, " + left + ", " + right); emit("xori a0, a0, 1"); }
-    else if (op == "==") { emit("sub a0, " + left + ", " + right); emit("seqz a0, a0"); }
-    else if (op == "!=") { emit("sub a0, " + left + ", " + right); emit("snez a0, a0"); }
+    if (op == "+") emit("add " + dest + ", " + left + ", " + right);
+    else if (op == "-") emit("sub " + dest + ", " + left + ", " + right);
+    else if (op == "*") emit("mul " + dest + ", " + left + ", " + right);
+    else if (op == "/") emit("div " + dest + ", " + left + ", " + right);
+    else if (op == "%") emit("rem " + dest + ", " + left + ", " + right);
+    else if (op == "<") emit("slt " + dest + ", " + left + ", " + right);
+    else if (op == ">") emit("slt " + dest + ", " + right + ", " + left);
+    else if (op == "<=") { emit("slt " + dest + ", " + right + ", " + left); emit("xori " + dest + ", " + dest + ", 1"); }
+    else if (op == ">=") { emit("slt " + dest + ", " + left + ", " + right); emit("xori " + dest + ", " + dest + ", 1"); }
+    else if (op == "==") { emit("sub " + dest + ", " + left + ", " + right); emit("seqz " + dest + ", " + dest); }
+    else if (op == "!=") { emit("sub " + dest + ", " + left + ", " + right); emit("snez " + dest + ", " + dest); }
     else return false;
     return true;
 }
@@ -1112,18 +1150,60 @@ bool CodeGen::tryEmitTailRecursiveCall(CallNode* node, int depth) {
         return false;
     }
 
-    // 先把所有新实参写到临时槽，避免例如 f(b, a) 覆盖尚待读取的旧形参。
-    for (size_t i = 0; i < node->args.size(); ++i) {
-        genExpr(node->args[i].get(), depth + static_cast<int>(i));
-        storeTemp(depth + static_cast<int>(i));
+    int n = static_cast<int>(node->args.size());
+    std::vector<const VarInfo*> plocs(n);
+    for (int i = 0; i < n; ++i) {
+        plocs[i] = lookupVar(currentFunctionParams[i]);
+        if (plocs[i] == nullptr) throw std::runtime_error("codegen: missing function parameter");
     }
-    for (size_t i = 0; i < currentFunctionParams.size(); ++i) {
-        const VarInfo* param = lookupVar(currentFunctionParams[i]);
-        if (param == nullptr) throw std::runtime_error("codegen: missing function parameter");
-        loadTemp(depth + static_cast<int>(i), "a0");
-        if (param->kind == VarInfo::Reg) emit("mv " + param->reg + ", a0");
-        else if (param->kind == VarInfo::Local) memInsn("sw", "a0", param->offset);
-        else throw std::runtime_error("codegen: invalid function parameter location");
+
+    // 恒等实参（实参就是对应形参本身，且未被内层同名局部遮蔽）无需搬移。
+    std::vector<int> moves;
+    bool anyArgCall = false;
+    for (int i = 0; i < n; ++i) {
+        if (containsCall(node->args[i].get())) anyArgCall = true;
+        if (auto* v = dynamic_cast<VarNode*>(node->args[i].get())) {
+            const VarInfo* av = lookupVar(v->name);
+            if (av != nullptr && av->kind == plocs[i]->kind &&
+                ((av->kind == VarInfo::Reg && av->reg == plocs[i]->reg) ||
+                 (av->kind == VarInfo::Local && av->offset == plocs[i]->offset))) {
+                continue;
+            }
+        }
+        moves.push_back(i);
+    }
+
+    // 新实参先集中求值再统一写回，避免例如 f(b, a) 覆盖尚待读取的旧形参。
+    // 无调用、待搬移实参 <=3 且表达式浅（求值只用 t 寄存器、不落栈）时，
+    // 用 t0..t2 中转实现零访存；否则退回栈临时槽的保守路径。
+    bool shallow = true;
+    for (int i : moves) {
+        if (exprMaxDepth(node->args[i].get(), 0) > 2) { shallow = false; break; }
+    }
+    if (!anyArgCall && shallow && static_cast<int>(moves.size()) <= 3) {
+        int stage = 0;
+        int evalDepth = static_cast<int>(moves.size());
+        for (int i : moves) {
+            genExprInto(node->args[i].get(), "t" + std::to_string(stage++), evalDepth);
+        }
+        stage = 0;
+        for (int i : moves) {
+            std::string src = "t" + std::to_string(stage++);
+            if (plocs[i]->kind == VarInfo::Reg) emit("mv " + plocs[i]->reg + ", " + src);
+            else if (plocs[i]->kind == VarInfo::Local) memInsn("sw", src, plocs[i]->offset);
+            else throw std::runtime_error("codegen: invalid function parameter location");
+        }
+    } else {
+        for (int i = 0; i < n; ++i) {
+            genExpr(node->args[i].get(), depth + i);
+            storeTemp(depth + i);
+        }
+        for (int i = 0; i < n; ++i) {
+            loadTemp(depth + i, "a0");
+            if (plocs[i]->kind == VarInfo::Reg) emit("mv " + plocs[i]->reg + ", a0");
+            else if (plocs[i]->kind == VarInfo::Local) memInsn("sw", "a0", plocs[i]->offset);
+            else throw std::runtime_error("codegen: invalid function parameter location");
+        }
     }
     emit("j " + tailEntryLabel);
     return true;
@@ -1163,6 +1243,12 @@ bool CodeGen::tryEmitOptimizedAssign(AssignNode* node) {
 // 计算二元运算的两个操作数：左值放入某寄存器（名字经 leftReg 返回），右值留在 a0。
 // 若右子树不含调用且深度够浅，左值暂存于 t(depth)；否则溢出到栈临时槽、再取回 t6。
 void CodeGen::genBinaryOperands(BinaryNode* node, int depth, std::string& leftReg) {
+    // 左操作数本身就是寄存器变量时直接引用其寄存器：ToyC 表达式无赋值副作用，
+    // 右子树求值只写 a0/t*（内联展开只写其自有的新增局部），寄存器变量保持不变。
+    if (opt && tryGetReg(node->left.get(), leftReg)) {
+        genExpr(node->right.get(), depth + 1);
+        return;
+    }
     genExpr(node->left.get(), depth);
     bool useReg = depth < 6 && !containsCall(node->right.get());
     if (useReg) {
@@ -1259,6 +1345,45 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
                 while ((1 << sh) < rv) sh++;
                 genExpr(bin->left.get(), depth);
                 emit("slli a0, a0, " + std::to_string(sh));
+                return;
+            }
+        }
+
+        // 右操作数已在寄存器（变量 / zero / 已提升常量）：左值求到 a0 后单条指令收尾，
+        // 免去 t 寄存器/栈临时槽的搬运。加减常量若在 addi 范围也走单指令。
+        if (opt && bin->op != "&&" && bin->op != "||") {
+            std::string rr;
+            bool haveR = tryGetReg(bin->right.get(), rr);
+            if (!haveR) {
+                int rc;
+                if (tryEvalConst(bin->right.get(), rc)) {
+                    if (rc == 0) { rr = "zero"; haveR = true; }
+                    else if (auto it = condConstRegs.find(rc); it != condConstRegs.end()) {
+                        rr = it->second;
+                        haveR = true;
+                    } else if (rc >= -2047 && rc <= 2047 &&
+                               (bin->op == "+" || bin->op == "-")) {
+                        genExpr(bin->left.get(), depth);
+                        int delta = bin->op == "+" ? rc : -rc;
+                        emit("addi a0, a0, " + std::to_string(delta));
+                        return;
+                    }
+                }
+            }
+            if (haveR) {
+                genExpr(bin->left.get(), depth);
+                const std::string& op2 = bin->op;
+                if (op2 == "+") emit("add a0, a0, " + rr);
+                else if (op2 == "-") emit("sub a0, a0, " + rr);
+                else if (op2 == "*") emit("mul a0, a0, " + rr);
+                else if (op2 == "/") emit("div a0, a0, " + rr);
+                else if (op2 == "%") emit("rem a0, a0, " + rr);
+                else if (op2 == "<") emit("slt a0, a0, " + rr);
+                else if (op2 == ">") emit("slt a0, " + rr + ", a0");
+                else if (op2 == "<=") { emit("slt a0, " + rr + ", a0"); emit("xori a0, a0, 1"); }
+                else if (op2 == ">=") { emit("slt a0, a0, " + rr); emit("xori a0, a0, 1"); }
+                else if (op2 == "==") { emit("sub a0, a0, " + rr); emit("seqz a0, a0"); }
+                else { emit("sub a0, a0, " + rr); emit("snez a0, a0"); }
                 return;
             }
         }
@@ -1455,6 +1580,34 @@ void CodeGen::genExprInto(ExprNode* node, const std::string& reg, int depth) {
     if (tryGetReg(node, src)) {
         if (src != reg) emit("mv " + reg + ", " + src);
         return;
+    }
+    // x = y op z（寄存器/立即数操作数）单条指令直达目标寄存器。
+    if (auto* bin = dynamic_cast<BinaryNode*>(node)) {
+        if (bin->op != "&&" && bin->op != "||") {
+            if (tryEmitRegBinary(bin, reg)) return;
+            // 右操作数在寄存器（变量 / zero / 已提升常量）：左值经 a0 后直达目标。
+            std::string rr;
+            bool haveR = tryGetReg(bin->right.get(), rr);
+            int rc;
+            if (!haveR && tryEvalConst(bin->right.get(), rc)) {
+                if (rc == 0) { rr = "zero"; haveR = true; }
+                else if (auto it = condConstRegs.find(rc); it != condConstRegs.end()) {
+                    rr = it->second;
+                    haveR = true;
+                }
+            }
+            if (haveR) {
+                genExpr(bin->left.get(), depth);
+                const std::string& op = bin->op;
+                if (op == "+") { emit("add " + reg + ", a0, " + rr); return; }
+                if (op == "-") { emit("sub " + reg + ", a0, " + rr); return; }
+                if (op == "*") { emit("mul " + reg + ", a0, " + rr); return; }
+                if (op == "/") { emit("div " + reg + ", a0, " + rr); return; }
+                if (op == "%") { emit("rem " + reg + ", a0, " + rr); return; }
+                if (op == "<") { emit("slt " + reg + ", a0, " + rr); return; }
+                if (op == ">") { emit("slt " + reg + ", " + rr + ", a0"); return; }
+            }
+        }
     }
     genExpr(node, depth);
     if (reg != "a0") emit("mv " + reg + ", a0");

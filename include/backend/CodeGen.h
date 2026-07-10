@@ -51,6 +51,9 @@ private:
     std::unordered_map<std::string, FuncDefNode*> funcDefs;  // 函数名 → 定义
     std::unordered_set<std::string> inlinableFuncs;          // 可在调用点展开的小叶子函数
     std::unordered_map<int, std::string> condConstRegs;      // 提升进空闲 s 寄存器的条件常量
+    std::string currentFunctionName;
+    std::vector<std::string> currentFunctionParams;
+    std::string tailEntryLabel;
     std::string epilogueLabel;
     std::vector<std::pair<std::string, std::string>> loopLabels;
 
@@ -89,6 +92,9 @@ private:
     void collectHoistConstsExpr(ExprNode* node, std::vector<int>& out, bool inLoop) const;
 
     bool tryEvalConst(ExprNode* node, int& out) const;
+    bool exprStructurallyEqual(ExprNode* left, ExprNode* right) const;
+    bool tryEmitAlgebraicSimplification(BinaryNode* node, int depth);
+    bool tryEmitTailRecursiveCall(CallNode* node, int depth);
 
     void genFunc(FuncDefNode* func);
     void genStmt(StmtNode* node);

@@ -580,6 +580,9 @@ void CodeGen::genFunc(FuncDefNode* func) {
     loopLabels.clear();
     condConstRegs.clear();
     tempBias = 0;
+    currentFunctionName = func->name;
+    currentFunctionParams = func->params;
+    tailEntryLabel.clear();
 
     int nparams = static_cast<int>(func->params.size());
     totalLocals = nparams + countLocalDecls(func->body.get());
@@ -606,6 +609,8 @@ void CodeGen::genFunc(FuncDefNode* func) {
         for (int i = nparams - 1; i >= 0; --i) {
             emit("mv a" + std::to_string(i + 1) + ", a" + std::to_string(i));
         }
+        tailEntryLabel = newLabel();
+        emitLabel(tailEntryLabel);
         genBlock(func->body.get(), false);
         emitLabel(epilogueLabel);
         emit("ret");
@@ -686,6 +691,8 @@ void CodeGen::genFunc(FuncDefNode* func) {
         loadImm(condConstRegs[hoisted[i]], hoisted[i]);
     }
 
+    tailEntryLabel = newLabel();
+    emitLabel(tailEntryLabel);
     genBlock(func->body.get(), false);
 
     emitLabel(epilogueLabel);
@@ -772,6 +779,12 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* ifn = dynamic_cast<IfNode*>(node)) {
+        int condition;
+        if (opt && tryEvalConst(ifn->condition.get(), condition)) {
+            if (condition != 0) genStmt(ifn->thenStmt.get());
+            else if (ifn->elseStmt != nullptr) genStmt(ifn->elseStmt.get());
+            return;
+        }
         std::string lend = newLabel();
         if (ifn->elseStmt != nullptr) {
             std::string lelse = newLabel();
@@ -791,6 +804,10 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* wh = dynamic_cast<WhileNode*>(node)) {
+        int condition;
+        if (opt && tryEvalConst(wh->condition.get(), condition) && condition == 0) {
+            return;
+        }
         // 循环旋转：条件测试置于循环底部，稳态每次迭代仅一条“为真回跳”分支，
         // 省去底部的无条件回跳。首次进入先跳到条件处测试。
         std::string lcond = newLabel();
@@ -819,6 +836,11 @@ void CodeGen::genStmt(StmtNode* node) {
 
     if (auto* ret = dynamic_cast<ReturnNode*>(node)) {
         if (ret->retExpr != nullptr) {
+            if (auto* call = dynamic_cast<CallNode*>(ret->retExpr.get())) {
+                if (tryEmitTailRecursiveCall(call, 0)) return;
+            }
+        }
+        if (ret->retExpr != nullptr) {
             genExpr(ret->retExpr.get(), 0);
         }
         emit("j " + epilogueLabel);
@@ -826,6 +848,7 @@ void CodeGen::genStmt(StmtNode* node) {
     }
 
     if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
+        if (opt && es->expr != nullptr && !containsCall(es->expr.get())) return;
         if (es->expr != nullptr) genExpr(es->expr.get(), 0);
         return;
     }
@@ -871,6 +894,124 @@ bool CodeGen::tryEmitRegBinary(BinaryNode* node) {
     else if (op == "==") { emit("sub a0, " + left + ", " + right); emit("seqz a0, a0"); }
     else if (op == "!=") { emit("sub a0, " + left + ", " + right); emit("snez a0, a0"); }
     else return false;
+    return true;
+}
+
+bool CodeGen::exprStructurallyEqual(ExprNode* left, ExprNode* right) const {
+    if (left == nullptr || right == nullptr) return left == right;
+    if (auto* l = dynamic_cast<LiteralNode*>(left)) {
+        auto* r = dynamic_cast<LiteralNode*>(right);
+        return r != nullptr && l->value == r->value;
+    }
+    if (auto* l = dynamic_cast<VarNode*>(left)) {
+        auto* r = dynamic_cast<VarNode*>(right);
+        return r != nullptr && l->name == r->name;
+    }
+    if (auto* l = dynamic_cast<UnaryNode*>(left)) {
+        auto* r = dynamic_cast<UnaryNode*>(right);
+        return r != nullptr && l->op == r->op &&
+               exprStructurallyEqual(l->operand.get(), r->operand.get());
+    }
+    if (auto* l = dynamic_cast<BinaryNode*>(left)) {
+        auto* r = dynamic_cast<BinaryNode*>(right);
+        return r != nullptr && l->op == r->op &&
+               exprStructurallyEqual(l->left.get(), r->left.get()) &&
+               exprStructurallyEqual(l->right.get(), r->right.get());
+    }
+    if (auto* l = dynamic_cast<CallNode*>(left)) {
+        auto* r = dynamic_cast<CallNode*>(right);
+        if (r == nullptr || l->funcName != r->funcName || l->args.size() != r->args.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < l->args.size(); ++i) {
+            if (!exprStructurallyEqual(l->args[i].get(), r->args[i].get())) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool CodeGen::tryEmitAlgebraicSimplification(BinaryNode* node, int depth) {
+    if (!opt) return false;
+
+    int leftConst;
+    int rightConst;
+    bool leftIsConst = tryEvalConst(node->left.get(), leftConst);
+    bool rightIsConst = tryEvalConst(node->right.get(), rightConst);
+    const std::string& op = node->op;
+
+    if ((op == "+" && rightIsConst && rightConst == 0) ||
+        (op == "-" && rightIsConst && rightConst == 0) ||
+        (op == "*" && rightIsConst && rightConst == 1) ||
+        (op == "/" && rightIsConst && rightConst == 1)) {
+        genExpr(node->left.get(), depth);
+        return true;
+    }
+    if ((op == "+" && leftIsConst && leftConst == 0) ||
+        (op == "*" && leftIsConst && leftConst == 1)) {
+        genExpr(node->right.get(), depth);
+        return true;
+    }
+    if ((op == "*" && ((leftIsConst && leftConst == 0) ||
+                        (rightIsConst && rightConst == 0))) ||
+        (op == "%" && rightIsConst && (rightConst == 1 || rightConst == -1))) {
+        // 仍要求值非字面量一侧，以保留可能存在的函数调用副作用。
+        if (op == "*" && leftIsConst) genExpr(node->right.get(), depth);
+        else genExpr(node->left.get(), depth);
+        loadImm("a0", 0);
+        return true;
+    }
+    if (op == "*" && ((leftIsConst && leftConst == -1) ||
+                      (rightIsConst && rightConst == -1))) {
+        if (leftIsConst) genExpr(node->right.get(), depth);
+        else genExpr(node->left.get(), depth);
+        emit("neg a0, a0");
+        return true;
+    }
+
+    if (!containsCall(node->left.get()) &&
+        exprStructurallyEqual(node->left.get(), node->right.get())) {
+        if (op == "-") {
+            loadImm("a0", 0);
+            return true;
+        }
+        if (op == "+") {
+            genExpr(node->left.get(), depth);
+            emit("slli a0, a0, 1");
+            return true;
+        }
+        if (op == "==" || op == "<=" || op == ">=") {
+            loadImm("a0", 1);
+            return true;
+        }
+        if (op == "!=" || op == "<" || op == ">") {
+            loadImm("a0", 0);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool CodeGen::tryEmitTailRecursiveCall(CallNode* node, int depth) {
+    if (!opt || node->funcName != currentFunctionName ||
+        node->args.size() != currentFunctionParams.size() || tailEntryLabel.empty()) {
+        return false;
+    }
+
+    // 先把所有新实参写到临时槽，避免例如 f(b, a) 覆盖尚待读取的旧形参。
+    for (size_t i = 0; i < node->args.size(); ++i) {
+        genExpr(node->args[i].get(), depth + static_cast<int>(i));
+        storeTemp(depth + static_cast<int>(i));
+    }
+    for (size_t i = 0; i < currentFunctionParams.size(); ++i) {
+        const VarInfo* param = lookupVar(currentFunctionParams[i]);
+        if (param == nullptr) throw std::runtime_error("codegen: missing function parameter");
+        loadTemp(depth + static_cast<int>(i), "a0");
+        if (param->kind == VarInfo::Reg) emit("mv " + param->reg + ", a0");
+        else if (param->kind == VarInfo::Local) memInsn("sw", "a0", param->offset);
+        else throw std::runtime_error("codegen: invalid function parameter location");
+    }
+    emit("j " + tailEntryLabel);
     return true;
 }
 
@@ -971,6 +1112,8 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
             genLogical(bin, depth);
             return;
         }
+
+        if (tryEmitAlgebraicSimplification(bin, depth)) return;
 
         if (tryEmitRegBinary(bin)) return;
 

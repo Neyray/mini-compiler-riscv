@@ -29,6 +29,8 @@ private:
         std::string label;  // Global
         int offset;         // Local：相对 s0 的（负）偏移
         std::string reg;    // Reg：s1..s11
+        bool hasKnownValue = false;  // -opt 下的局部前向常量传播
+        int knownValue = 0;
     };
 
     bool opt;
@@ -51,6 +53,8 @@ private:
     std::unordered_map<std::string, FuncDefNode*> funcDefs;  // 函数名 → 定义
     std::unordered_set<std::string> inlinableFuncs;          // 可在调用点展开的小叶子函数
     std::unordered_map<int, std::string> condConstRegs;      // 提升进空闲 s 寄存器的条件常量
+    ExprNode* cachedPureExpr = nullptr;                      // 相邻语句的保守公共子表达式缓存
+    VarInfo cachedPureValue;
     std::string currentFunctionName;
     std::vector<std::string> currentFunctionParams;
     std::string tailEntryLabel;
@@ -60,6 +64,8 @@ private:
     void pushScope();
     void popScope();
     const VarInfo* lookupVar(const std::string& name) const;
+    VarInfo* lookupVarMutable(const std::string& name);
+    void clearMutableKnownValues();
     VarInfo assignLocalLocation();
     bool tryGetReg(ExprNode* node, std::string& reg) const;
 
@@ -93,6 +99,9 @@ private:
 
     bool tryEvalConst(ExprNode* node, int& out) const;
     bool exprStructurallyEqual(ExprNode* left, ExprNode* right) const;
+    bool tryLoadCachedPureExpr(ExprNode* node);
+    void cachePureExpr(ExprNode* expr, const VarInfo& value);
+    void clearPureExprCache();
     bool tryEmitAlgebraicSimplification(BinaryNode* node, int depth);
     bool tryEmitTailRecursiveCall(CallNode* node, int depth);
 

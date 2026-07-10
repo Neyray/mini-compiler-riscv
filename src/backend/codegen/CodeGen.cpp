@@ -27,6 +27,54 @@ const CodeGen::VarInfo* CodeGen::lookupVar(const std::string& name) const {
     return nullptr;
 }
 
+CodeGen::VarInfo* CodeGen::lookupVarMutable(const std::string& name) {
+    for (auto it = scopes.rbegin(); it != scopes.rend(); ++it) {
+        auto found = it->find(name);
+        if (found != it->end()) {
+            return &found->second;
+        }
+    }
+    return nullptr;
+}
+
+void CodeGen::clearMutableKnownValues() {
+    for (auto& scope : scopes) {
+        for (auto& [_, info] : scope) {
+            if (info.kind != VarInfo::Const) info.hasKnownValue = false;
+        }
+    }
+}
+
+void CodeGen::clearPureExprCache() {
+    cachedPureExpr = nullptr;
+}
+
+void CodeGen::cachePureExpr(ExprNode* expr, const VarInfo& value) {
+    if (opt && expr != nullptr && !containsCall(expr) &&
+        (value.kind == VarInfo::Reg || value.kind == VarInfo::Local)) {
+        cachedPureExpr = expr;
+        cachedPureValue = value;
+    } else {
+        clearPureExprCache();
+    }
+}
+
+bool CodeGen::tryLoadCachedPureExpr(ExprNode* node) {
+    if (!opt || cachedPureExpr == nullptr || containsCall(node) ||
+        !exprStructurallyEqual(cachedPureExpr, node)) {
+        return false;
+    }
+
+    if (cachedPureValue.kind == VarInfo::Reg) {
+        emit("mv a0, " + cachedPureValue.reg);
+    } else if (cachedPureValue.kind == VarInfo::Local) {
+        memInsn("lw", "a0", cachedPureValue.offset);
+    } else {
+        return false;
+    }
+    return true;
+}
+
 // 为一个局部声明/形参分配存储。
 // 叶子无栈帧模式：全部落入调用者保存寄存器 a1..a7（第 idx 个 → a(idx+1)）。
 // 普通模式：前 11 个进 s1..s11，其余落栈。
@@ -473,6 +521,10 @@ bool CodeGen::tryEvalConst(ExprNode* node, int& out) const {
             out = v->constVal;
             return true;
         }
+        if (opt && v != nullptr && v->hasKnownValue) {
+            out = v->knownValue;
+            return true;
+        }
         return false;
     }
     if (auto* un = dynamic_cast<UnaryNode*>(node)) {
@@ -583,6 +635,7 @@ void CodeGen::genFunc(FuncDefNode* func) {
     currentFunctionName = func->name;
     currentFunctionParams = func->params;
     tailEntryLabel.clear();
+    clearPureExprCache();
 
     int nparams = static_cast<int>(func->params.size());
     totalLocals = nparams + countLocalDecls(func->body.get());
@@ -720,9 +773,26 @@ void CodeGen::genFunc(FuncDefNode* func) {
 // ---------- 语句 ----------
 
 void CodeGen::genBlock(BlockNode* node, bool createScope) {
-    if (createScope) pushScope();
-    for (const auto& s : node->stmts) genStmt(s.get());
-    if (createScope) popScope();
+    int savedCursor = localCursor;
+    if (createScope) {
+        pushScope();
+        clearPureExprCache();
+    }
+    for (const auto& s : node->stmts) {
+        genStmt(s.get());
+        // 这些直接终结语句后的同一块语句不可达，不生成即可避免死代码进入输出。
+        if (opt && (dynamic_cast<ReturnNode*>(s.get()) != nullptr ||
+                    dynamic_cast<BreakNode*>(s.get()) != nullptr ||
+                    dynamic_cast<ContinueNode*>(s.get()) != nullptr)) {
+            break;
+        }
+    }
+    if (createScope) {
+        popScope();
+        // 块作用域已经退出：后续互斥/顺序块可安全复用其局部寄存器或栈槽。
+        localCursor = savedCursor;
+        clearPureExprCache();
+    }
 }
 
 void CodeGen::genStmt(StmtNode* node) {
@@ -741,32 +811,61 @@ void CodeGen::genStmt(StmtNode* node) {
                 info.kind = VarInfo::Const;
                 info.constVal = v;
                 scopes.back()[decl->name] = info;
+                clearPureExprCache();
                 return;
             }
         }
         VarInfo info = assignLocalLocation();
+        int knownValue = 0;
+        if (opt && tryEvalConst(decl->initExpr.get(), knownValue)) {
+            info.hasKnownValue = true;
+            info.knownValue = knownValue;
+        }
+        bool cacheHit = tryLoadCachedPureExpr(decl->initExpr.get());
+        if (!cacheHit) clearPureExprCache();
         if (opt && info.kind == VarInfo::Reg) {
-            genExprInto(decl->initExpr.get(), info.reg, 0);
+            if (cacheHit) emit("mv " + info.reg + ", a0");
+            else genExprInto(decl->initExpr.get(), info.reg, 0);
         } else {
-            genExpr(decl->initExpr.get(), 0);
+            if (!cacheHit) genExpr(decl->initExpr.get(), 0);
             if (info.kind == VarInfo::Reg) emit("mv " + info.reg + ", a0");
             else memInsn("sw", "a0", info.offset);
         }
         scopes.back()[decl->name] = info;
+        cachePureExpr(decl->initExpr.get(), info);
         return;
     }
 
     if (auto* asn = dynamic_cast<AssignNode*>(node)) {
-        if (tryEmitOptimizedAssign(asn)) return;
+        int knownValue = 0;
+        bool rhsKnown = opt && tryEvalConst(asn->rhs.get(), knownValue);
+        auto updateKnownValue = [&]() {
+            VarInfo* current = lookupVarMutable(asn->name);
+            if (current != nullptr && current->kind != VarInfo::Const &&
+                current->kind != VarInfo::Global) {
+                current->hasKnownValue = rhsKnown;
+                current->knownValue = knownValue;
+            }
+        };
+        bool cacheHit = tryLoadCachedPureExpr(asn->rhs.get());
+        if (!cacheHit) clearPureExprCache();
+        if (!cacheHit && tryEmitOptimizedAssign(asn)) {
+            updateKnownValue();
+            cachePureExpr(asn->rhs.get(), *lookupVar(asn->name));
+            return;
+        }
 
         const VarInfo* found = lookupVar(asn->name);
         if (found == nullptr) throw std::runtime_error("codegen: undefined variable " + asn->name);
         VarInfo v = *found;  // 值拷贝：rhs 内的内联展开会临时切换作用域栈
         if (opt && v.kind == VarInfo::Reg) {
-            genExprInto(asn->rhs.get(), v.reg, 0);
+            if (cacheHit) emit("mv " + v.reg + ", a0");
+            else genExprInto(asn->rhs.get(), v.reg, 0);
+            updateKnownValue();
+            cachePureExpr(asn->rhs.get(), v);
             return;
         }
-        genExpr(asn->rhs.get(), 0);
+        if (!cacheHit) genExpr(asn->rhs.get(), 0);
         if (v.kind == VarInfo::Global) {
             emit("la t6, " + v.label);
             emit("sw a0, 0(t6)");
@@ -775,6 +874,8 @@ void CodeGen::genStmt(StmtNode* node) {
         } else if (v.kind == VarInfo::Local) {
             memInsn("sw", "a0", v.offset);
         }
+        updateKnownValue();
+        cachePureExpr(asn->rhs.get(), v);
         return;
     }
 
@@ -785,12 +886,15 @@ void CodeGen::genStmt(StmtNode* node) {
             else if (ifn->elseStmt != nullptr) genStmt(ifn->elseStmt.get());
             return;
         }
+        clearPureExprCache();
+        auto savedScopes = scopes;
         std::string lend = newLabel();
         if (ifn->elseStmt != nullptr) {
             std::string lelse = newLabel();
             // 条件为假时跳到 else，为真则顺序落入 then（省去一次无条件跳转）。
             genCondJump(ifn->condition.get(), lelse, false, 0);
             genStmt(ifn->thenStmt.get());
+            scopes = savedScopes;
             emit("j " + lend);
             emitLabel(lelse);
             genStmt(ifn->elseStmt.get());
@@ -800,6 +904,11 @@ void CodeGen::genStmt(StmtNode* node) {
             genStmt(ifn->thenStmt.get());
             emitLabel(lend);
         }
+        // 非常量分支后，两条路径的可变值不能安全合并；保留存储位置，
+        // 但丢弃所有可变常量事实，避免把“分支未执行”的旧值带到分支后。
+        scopes = std::move(savedScopes);
+        if (opt) clearMutableKnownValues();
+        clearPureExprCache();
         return;
     }
 
@@ -808,6 +917,10 @@ void CodeGen::genStmt(StmtNode* node) {
         if (opt && tryEvalConst(wh->condition.get(), condition) && condition == 0) {
             return;
         }
+        // 循环可执行零次或多次，且循环体会反复修改局部变量；不能把循环前的
+        // 单次常量事实用于条件或下一轮迭代。
+        if (opt) clearMutableKnownValues();
+        clearPureExprCache();
         // 循环旋转：条件测试置于循环底部，稳态每次迭代仅一条“为真回跳”分支，
         // 省去底部的无条件回跳。首次进入先跳到条件处测试。
         std::string lcond = newLabel();
@@ -850,6 +963,7 @@ void CodeGen::genStmt(StmtNode* node) {
     if (auto* es = dynamic_cast<ExprStmtNode*>(node)) {
         if (opt && es->expr != nullptr && !containsCall(es->expr.get())) return;
         if (es->expr != nullptr) genExpr(es->expr.get(), 0);
+        if (es->expr != nullptr && containsCall(es->expr.get())) clearPureExprCache();
         return;
     }
 }
@@ -1355,6 +1469,8 @@ void CodeGen::genInlineCall(CallNode* node, int depth) {
     FuncDefNode* callee = funcDefs.at(node->funcName);
     int n = static_cast<int>(node->args.size());
 
+    clearPureExprCache();
+    int savedCursor = localCursor;
     std::vector<VarInfo> paramLocs;
     paramLocs.reserve(n);
     for (int i = 0; i < n; ++i) paramLocs.push_back(assignLocalLocation());
@@ -1389,6 +1505,8 @@ void CodeGen::genInlineCall(CallNode* node, int depth) {
     epilogueLabel = savedEpilogue;
     popScope();
     scopes = std::move(savedScopes);
+    localCursor = savedCursor;
+    clearPureExprCache();
 }
 
 void CodeGen::genCall(CallNode* node, int depth) {
@@ -1397,6 +1515,7 @@ void CodeGen::genCall(CallNode* node, int depth) {
         return;
     }
 
+    clearPureExprCache();
     int n = static_cast<int>(node->args.size());
 
     if (opt && n == 1) {

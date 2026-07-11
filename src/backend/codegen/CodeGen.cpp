@@ -83,10 +83,7 @@ CodeGen::VarInfo CodeGen::assignLocalLocation() {
     VarInfo info;
     if (aRegLeaf) {
         info.kind = VarInfo::Reg;
-        // 浅表达式的无调用函数只会占用 t0/t1 作表达式暂存；
-        // 第 8 至 11 个局部可安全使用 t2..t5，仍无需栈帧。
-        info.reg = idx < 7 ? "a" + std::to_string(1 + idx)
-                           : "t" + std::to_string(idx - 5);
+        info.reg = "a" + std::to_string(1 + idx);
         return info;
     }
     if (idx < 11) {
@@ -321,25 +318,6 @@ void CodeGen::collectCondConstLits(ExprNode* cond, std::vector<int>& out) const 
 // 深入可内联调用点的函数体（内联后这些条件同样出现在本函数中）。
 void CodeGen::collectHoistConstsExpr(ExprNode* node, std::vector<int>& out, bool inLoop) const {
     if (node == nullptr) return;
-    int known;
-    // 预扫描阶段已建立全局常量作用域，因此全局 const 名及其常量表达式也能在
-    // 此处识别。此前只看 LiteralNode，会漏掉 while 内反复使用的全局常量。
-    if (inLoop && tryEvalConst(node, known)) {
-        if ((known < -2048 || known > 2047) &&
-            std::find(out.begin(), out.end(), known) == out.end()) {
-            out.push_back(known);
-        }
-        return;
-    }
-    if (auto* lit = dynamic_cast<LiteralNode*>(node)) {
-        // 大立即数在循环任何位置都需要 lui/addi；不仅是比较或算术操作数，
-        // 还可能出现在实参、返回值和赋值右值中。提升后改为一次 li + 每轮 mv。
-        if (inLoop && (lit->value < -2048 || lit->value > 2047) &&
-            std::find(out.begin(), out.end(), lit->value) == out.end()) {
-            out.push_back(lit->value);
-        }
-        return;
-    }
     if (auto* un = dynamic_cast<UnaryNode*>(node)) {
         collectHoistConstsExpr(un->operand.get(), out, inLoop);
         return;
@@ -647,8 +625,8 @@ void CodeGen::generate(CompUnitNode* root, std::ostream& out) {
         for (const auto& [name, f] : funcDefs) {
             if (stmtContainsCall(f->body.get())) continue;
             int locals = static_cast<int>(f->params.size()) + countLocalDecls(f->body.get());
-            if (locals > 10) continue;
-            if (nodeCountStmt(f->body.get()) > 96) continue;
+            if (locals > 8) continue;
+            if (nodeCountStmt(f->body.get()) > 48) continue;
             inlinableFuncs.insert(name);
         }
     }
@@ -685,10 +663,8 @@ void CodeGen::genFunc(FuncDefNode* func) {
     // 叶子无栈帧模式：无函数调用、局部数 <=7（可全部放入 a1..a7），
     // 且表达式嵌套深度 <6（不会产生栈上临时槽）。此时函数只使用调用者保存寄存器，
     // 天然保持全部被调用者保存寄存器不变，可完全省去栈帧与序言/尾声。
-    int maxDepth = stmtMaxDepth(func->body.get());
-    aRegLeaf = opt && !funcHasCall && nparams <= 7 &&
-               ((totalLocals <= 7 && maxDepth < 6) ||
-                (totalLocals <= 11 && maxDepth < 2));
+    aRegLeaf = opt && !funcHasCall && totalLocals <= 7 &&
+               stmtMaxDepth(func->body.get()) < 6;
 
     epilogueLabel = newLabel();
     emit(".globl " + func->name);
@@ -923,8 +899,8 @@ void CodeGen::genStmt(StmtNode* node) {
         }
         if (!cacheHit) genExpr(asn->rhs.get(), 0);
         if (v.kind == VarInfo::Global) {
-            emit("lui t6, %hi(" + v.label + ")");
-            emit("sw a0, %lo(" + v.label + ")(t6)");
+            emit("la t6, " + v.label);
+            emit("sw a0, 0(t6)");
         } else if (v.kind == VarInfo::Reg) {
             emit("mv " + v.reg + ", a0");
         } else if (v.kind == VarInfo::Local) {
@@ -1291,13 +1267,6 @@ void CodeGen::genBinaryOperands(BinaryNode* node, int depth, std::string& leftRe
 void CodeGen::genExpr(ExprNode* node, int depth) {
     int cv;
     if (tryEvalConst(node, cv)) {
-        if (opt) {
-            auto it = condConstRegs.find(cv);
-            if (it != condConstRegs.end()) {
-                emit("mv a0, " + it->second);
-                return;
-            }
-        }
         loadImm("a0", cv);
         return;
     }
@@ -1307,10 +1276,7 @@ void CodeGen::genExpr(ExprNode* node, int depth) {
         if (v == nullptr) throw std::runtime_error("codegen: undefined variable " + var->name);
         if (v->kind == VarInfo::Const) loadImm("a0", v->constVal);
         else if (v->kind == VarInfo::Reg) emit("mv a0, " + v->reg);
-        else if (v->kind == VarInfo::Global) {
-            emit("lui a0, %hi(" + v->label + ")");
-            emit("lw a0, %lo(" + v->label + ")(a0)");
-        }
+        else if (v->kind == VarInfo::Global) { emit("la a0, " + v->label); emit("lw a0, 0(a0)"); }
         else memInsn("lw", "a0", v->offset);
         return;
     }
@@ -1445,19 +1411,20 @@ void CodeGen::genLogical(BinaryNode* node, int depth) {
     std::string lend = newLabel();
     if (node->op == "&&") {
         std::string lfalse = newLabel();
-        // 值语境同样复用条件跳转：关系式无需先物化 0/1 再测试。
-        genCondJump(node->left.get(), lfalse, false, depth);
-        genCondJump(node->right.get(), lfalse, false, depth);
-        emit("li a0, 1");
+        genExpr(node->left.get(), depth);
+        emit("beqz a0, " + lfalse);
+        genExpr(node->right.get(), depth);
+        emit("snez a0, a0");
         emit("j " + lend);
         emitLabel(lfalse);
         emit("li a0, 0");
         emitLabel(lend);
     } else {
         std::string ltrue = newLabel();
-        genCondJump(node->left.get(), ltrue, true, depth);
-        genCondJump(node->right.get(), ltrue, true, depth);
-        emit("li a0, 0");
+        genExpr(node->left.get(), depth);
+        emit("bnez a0, " + ltrue);
+        genExpr(node->right.get(), depth);
+        emit("snez a0, a0");
         emit("j " + lend);
         emitLabel(ltrue);
         emit("li a0, 1");
@@ -1606,13 +1573,6 @@ void CodeGen::genCondJump(ExprNode* node, const std::string& target,
 void CodeGen::genExprInto(ExprNode* node, const std::string& reg, int depth) {
     int cv;
     if (tryEvalConst(node, cv)) {
-        if (opt) {
-            auto it = condConstRegs.find(cv);
-            if (it != condConstRegs.end()) {
-                if (reg != it->second) emit("mv " + reg + ", " + it->second);
-                return;
-            }
-        }
         loadImm(reg, cv);
         return;
     }
